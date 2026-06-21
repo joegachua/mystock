@@ -206,16 +206,23 @@ if page == "내 포트폴리오 분석":
         {"티커": "SPY", "수익률(%)": 22.2},
         {"티커": "CPNG", "수익률(%)": -6.1},
     ])
+    editor_ver = st.session_state.get("editor_ver", 0)
     edited = st.data_editor(
         pd.DataFrame(default_rows),
         num_rows="dynamic",
         use_container_width=True,
+        hide_index=True,
+        column_order=["티커", "수익률(%)"],
         column_config={
-            "티커": st.column_config.TextColumn("티커", help="예: NVDA", width="medium"),
-            "수익률(%)": st.column_config.NumberColumn("수익률 (%)", help="토스에서 보이는 총 수익률", format="%.1f"),
+            "티커": st.column_config.TextColumn("티커", help="예: NVDA", width="large", pinned=True),
+            "수익률(%)": st.column_config.NumberColumn("수익률 (%)", help="토스에서 보이는 총 수익률", format="%.1f", width="large"),
         },
-        key="holdings_editor",
+        key=f"holdings_editor_{editor_ver}",
     )
+    if st.button("표 초기화 (컬럼이 사라졌거나 꼬였을 때)"):
+        st.session_state.pop("holdings_df", None)
+        st.session_state["editor_ver"] = editor_ver + 1
+        st.rerun()
 
     if st.button("전체 분석", type="primary"):
         records = edited.to_dict("records")
