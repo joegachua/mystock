@@ -112,16 +112,22 @@ def extract_holdings_from_images(image_bytes_list):
         parts.append(types.Part.from_bytes(data=b, mime_type="image/png"))
     parts.append(types.Part.from_text(text=(
         "이 이미지들은 한국 증권 앱(토스 등)의 해외주식 포트폴리오 화면 캡처야. "
-        "각 종목의 (1) 미국 주식 티커 심볼, (2) 종목 한글/영문 이름, (3) 총 수익률(%)을 읽어줘. "
-        "티커를 모르면 회사 이름으로 가장 정확한 미국 티커를 추론해줘. "
-        "수익률은 빨강(+)/파랑(-) 부호를 반영해서 숫자로. 못 읽으면 null. "
-        "반드시 아래 JSON 배열 형식으로만 답해. 다른 말 절대 금지:\n"
-        '[{"ticker":"NVDA","name":"엔비디아","return_pct":17.3}, ...]'
+        "화면에 보이는 모든 종목을 빠짐없이 읽어줘. 각 종목마다 다음을 추출해:\n"
+        "(1) 미국 주식 티커 심볼 (대문자). 화면에 티커가 안 보이면 종목 이름으로 정확한 미국 티커를 추론해.\n"
+        "(2) 종목 이름 (보이는 그대로)\n"
+        "(3) 총 수익률(%) — 토스는 빨강이 +수익, 파랑이 -손실이야. 부호를 정확히 반영해. 숫자만, 못 읽으면 null.\n\n"
+        "주의사항:\n"
+        "- 같은 종목이 여러 번 나오면 한 번만. 중복 금지.\n"
+        "- 티커가 확실하지 않으면 가장 널리 알려진 미국 상장 보통주 티커를 써. (예: 구글->GOOGL, 버크셔->BRK-B)\n"
+        "- 평가금액·보유수량이 아니라 반드시 '수익률(%)'을 읽어. 토스에서 종목명 옆이나 아래의 퍼센트 숫자야.\n"
+        "- 한국 주식(삼성전자 등)이나 코인은 제외하고 미국 주식만.\n\n"
+        "반드시 아래 JSON 배열 형식으로만 답해. 다른 설명 절대 금지:\n"
+        '[{"ticker":"NVDA","name":"엔비디아","return_pct":17.3},{"ticker":"AAPL","name":"애플","return_pct":-5.2}]'
     )))
 
     try:
         resp = _client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash",
             contents=parts,
         )
         text = resp.text.strip()
@@ -130,7 +136,16 @@ def extract_holdings_from_images(image_bytes_list):
             if text.startswith("json"):
                 text = text[4:]
         data = json.loads(text.strip())
-        return data, None
+        # 중복 티커 제거 (첫 번째만 유지)
+        seen = set()
+        deduped = []
+        for d in data:
+            tk = (d.get("ticker") or "").strip().upper()
+            if tk and tk not in seen:
+                seen.add(tk)
+                d["ticker"] = tk
+                deduped.append(d)
+        return deduped, None
     except Exception as e:
         return None, f"이미지 인식 실패: {e}"
 
