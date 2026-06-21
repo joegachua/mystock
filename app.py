@@ -12,9 +12,17 @@ from stock_search import search_ticker as _search_ticker, get_price_history as _
 def score_stock(ticker, user_return_pct=None):
     return _score_stock(ticker, user_return_pct)
 
-@st.cache_data(ttl=600, show_spinner=False)   # 뉴스: 10분
+@st.cache_data(ttl=600, show_spinner=False)   # 뉴스: 10분 (결과 있을 때만 캐시)
+def _get_news_cached(ticker, limit=4):
+    result = _get_news(ticker, limit)
+    return result
+
 def get_news(ticker, limit=4):
-    return _get_news(ticker, limit)
+    # 빈 결과가 캐시에 박히면 10분간 빈 뉴스가 나오므로, 빈 결과는 캐시를 비우고 재시도 여지를 남긴다
+    result = _get_news_cached(ticker, limit)
+    if not result:
+        _get_news_cached.clear()
+    return result
 
 @st.cache_data(ttl=1800, show_spinner=False)  # 내부자 거래: 30분
 def get_insider_trades(ticker, limit=8):
