@@ -37,8 +37,23 @@ def get_volatility(ticker_obj):
         return None
 
 def score_stock(ticker, user_return_pct=None):
+    import time
+    info = {}
     t = yf.Ticker(ticker)
-    info = t.info
+    for attempt in range(4):
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info
+            if info and (info.get("shortName") or info.get("quoteType") or info.get("regularMarketPrice")):
+                break
+            info = {}
+        except Exception:
+            info = {}
+        if attempt < 3:
+            time.sleep(0.8 * (attempt + 1))  # 0.8, 1.6, 2.4초로 점점 길게
+    if not info:
+        raise ValueError(f"{ticker} 데이터를 불러오지 못했습니다 (일시적 오류일 수 있어요)")
+
     is_etf = info.get("quoteType") == "ETF"
     name = info.get("shortName", ticker)
 
