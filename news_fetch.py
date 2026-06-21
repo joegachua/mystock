@@ -1,10 +1,20 @@
-﻿import yfinance as yf
+"""yfinance로 종목 관련 최신 뉴스를 가져오는 모듈."""
+import yfinance as yf
+import time
 
 def get_news(ticker, limit=4):
-    try:
-        items = yf.Ticker(ticker).news or []
-    except Exception:
-        return []
+    """종목 티커의 최신 뉴스 목록을 반환한다. [{title, publisher, link, time}, ...]"""
+    items = []
+    for attempt in range(3):
+        try:
+            items = yf.Ticker(ticker).news or []
+            if items:
+                break
+        except Exception:
+            items = []
+        if attempt < 2:
+            time.sleep(0.7 * (attempt + 1))  # 0.7, 1.4초
+
     out = []
     for it in items[:limit]:
         c = it.get("content", it)
