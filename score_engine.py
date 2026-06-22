@@ -58,6 +58,8 @@ def score_stock(ticker, user_return_pct=None):
     name = info.get("shortName", ticker)
 
     result = {"ticker": ticker, "name": name, "is_etf": is_etf}
+    # 섹터(업종) — 섹터 분포 차트용. ETF나 정보 없으면 표시용 기본값.
+    result["sector"] = info.get("sector") or ("ETF" if is_etf else "기타/미분류")
 
     # ===== 수익성 점수 =====
     # 1. 수익률: -50%->0, 0%->50, +100%->100
