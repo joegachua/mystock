@@ -1,6 +1,6 @@
 import streamlit as st
 from score_engine import score_stock as _score_stock
-from ai_explain import init_client, explain_stock, summarize_news, extract_holdings_from_images, summarize_insider, analyze_government_policy, analyze_sector_policy_timeline, diagnose_portfolio
+from ai_explain import init_client, explain_stock, summarize_news, extract_holdings_from_images, summarize_insider, analyze_government_policy, analyze_sector_policy_timeline, diagnose_portfolio, analyze_remarks_overview, analyze_remarks_sector, analyze_trending_sectors, analyze_sector_focus, analyze_holding_thesis
 from news_fetch import get_news as _get_news
 from insider_fetch import get_insider_trades as _get_insider_trades
 from superinvestor_fetch import get_13f_holdings as _get_13f_holdings, SUPER_INVESTORS, guess_ticker as _guess_ticker, get_13f_comparison as _get_13f_comparison
@@ -71,8 +71,9 @@ def search_ticker(query):
     return _search_ticker(query)
 
 @st.cache_data(ttl=3600, show_spinner=False)  # 주가 차트: 1시간
-def get_price_history(ticker, period="20y"):
-    return _get_price_history(ticker, period)
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_price_history(ticker, period="20y", interval="1mo"):
+    return _get_price_history(ticker, period, interval)
 # ───────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="포트폴리오 점수 분석", page_icon="🚀", layout="wide")
@@ -258,10 +259,49 @@ def policy_ticker_section(tickers, key_prefix, names=None):
     st.caption("더 자세히 보려면 '종목 검색' 탭에서 같은 티커를 검색해보세요.")
 
 
+def policy_sources_expander(data):
+    """정책/발언 분석 결과의 출처·검색어를 접이식으로 보여준다.
+    data dict는 _grounded_generate 형식({sources, queries, ...})을 따른다."""
+    sources = data.get("sources") or []
+    queries = data.get("queries") or []
+    if not (sources or queries):
+        st.caption("이번 분석에서는 표시할 출처를 가져오지 못했어요. (검색이 일어나지 않았을 수 있어요)")
+        return
+    with st.expander(f"🔎 AI가 참고한 출처 {len(sources)}개 보기"):
+        if queries:
+            st.markdown(
+                "<div style='color:#9BA0C4;font-size:12px;margin-bottom:6px'>AI 검색어: "
+                + ", ".join(f"<span style='color:#AFA9EC'>{q}</span>" for q in queries)
+                + "</div>", unsafe_allow_html=True)
+        for s in sources:
+            title = s.get("title") or s.get("uri")
+            uri = s.get("uri")
+            st.markdown(
+                f"<div style='font-size:13px;margin:3px 0'>• "
+                f"<a href='{uri}' target='_blank' style='color:#9BC4FF;text-decoration:none'>{title}</a></div>",
+                unsafe_allow_html=True)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_usdkrw():
+    """현재 원/달러 환율을 가져온다(30분 캐시). 실패하면 None."""
+    import yfinance as yf
+    for sym in ("KRW=X", "USDKRW=X"):
+        try:
+            h = yf.Ticker(sym).history(period="5d")
+            if not h.empty:
+                v = float(h["Close"].dropna().iloc[-1])
+                if v > 100:           # 정상 환율 범위 방어
+                    return round(v, 1)
+        except Exception:
+            pass
+    return None
+
+
 # ===== 사이드바: 메뉴 + Gemini API 키 =====
 with st.sidebar:
     st.markdown("### 메뉴")
-    page = st.radio("페이지 선택", ["내 포트폴리오 분석", "부자들은 요즘 뭘 샀나", "종목 검색", "미국 정부·정책 분석"],
+    page = st.radio("페이지 선택", ["내 포트폴리오 분석", "부자들은 요즘 뭘 샀나", "종목 검색", "미국 정부·정책 분석", "관심 많은 분야"],
                     label_visibility="collapsed")
     st.divider()
     st.markdown("### 설정")
@@ -281,6 +321,16 @@ if page == "내 포트폴리오 분석":
         "</div>",
         unsafe_allow_html=True)
     st.markdown("<div style='color:#9BA0C4;font-size:13px;margin-bottom:6px'>아래 표에 종목 티커와 수익률을 입력하세요. 행은 자유롭게 추가·삭제할 수 있습니다.</div>", unsafe_allow_html=True)
+
+    _fx = get_usdkrw()
+    if _fx:
+        st.markdown(
+            f"<div style='background:rgba(127,119,221,0.08);border:0.5px solid rgba(175,169,236,0.25);"
+            f"border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:13px;color:#C5C9E8'>"
+            f"💱 현재 환율 <b style='color:#AFA9EC'>1달러 ≈ {_fx:,.1f}원</b> "
+            f"<span style='color:#6E7396'>· 미국 주식은 달러로 사고팔아요. 환율이 오르면(원화 약세) 주가가 그대로여도 원화 평가액은 커지고, "
+            f"내리면 반대예요. 즉 <b>실제 수익엔 '주가 + 환율'이 같이 작용</b>해요.</span></div>",
+            unsafe_allow_html=True)
 
     with st.expander("포트폴리오 캡처로 자동 입력 (토스 등)"):
         st.caption("캡처에 종목명과 수익률이 보이게 찍어주세요. 여러 장도 가능합니다.")
@@ -454,7 +504,23 @@ if page == "내 포트폴리오 분석":
                         f"<div style='width:{pct}%;height:100%;background:{color};border-radius:5px'></div></div></div>",
                         unsafe_allow_html=True)
                 if len(sec_counts) == 1:
-                    st.caption("⚠️ 한 업종에 집중돼 있어요. 분산 효과는 제한적일 수 있어요.")
+                    pass  # 아래 쏠림 점검에서 함께 안내
+                # ── 쏠림(집중) 점검 ──
+                top_sec, top_cnt = max(sec_counts.items(), key=lambda x: x[1])
+                top_pct = top_cnt / total_n * 100
+                warns = []
+                if len(sec_counts) == 1:
+                    warns.append("모든 종목이 한 업종에 있어요. 그 업종이 흔들리면 포트폴리오 전체가 같이 흔들릴 수 있어요.")
+                elif top_pct >= 50:
+                    warns.append(f"'{top_sec}' 업종에 전체의 {top_pct:.0f}%가 몰려 있어요. 한 업종 쏠림이 큰 편이에요.")
+                if total_n <= 3:
+                    warns.append(f"종목이 {total_n}개로 적어요. 종목 수가 적으면 한 종목이 흔들릴 때 영향이 커져요.")
+                if warns:
+                    for w in warns:
+                        st.caption(f"⚠️ {w}")
+                    st.caption("💡 '분산'은 여러 업종·종목에 나눠 담아서 한 곳이 무너져도 충격을 줄이는 거예요. (강제는 아니고 참고용이에요.)")
+                else:
+                    st.caption("✅ 업종이 비교적 고르게 퍼져 있어요. 분산은 위험을 낮추는 투자의 기본기예요.")
 
             # ── (3) 목표가 도달 현황 (애널리스트 목표가 대비 현재가) ──
             reach_rows = []
@@ -481,6 +547,34 @@ if page == "내 포트폴리오 분석":
                         f"<div style='width:{bar_w}%;height:100%;background:{color};border-radius:5px'></div></div></div>",
                         unsafe_allow_html=True)
 
+            # ── (3.5) 다가오는 실적 발표 일정 ──────────────
+            import datetime as _dt
+            _today = _dt.date.today()
+            earn_rows = []
+            for r in ok:
+                ed = r.get("earnings_date")
+                if not ed:
+                    continue
+                try:
+                    d = _dt.datetime.strptime(ed, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if d >= _today:
+                    earn_rows.append((d, clean_name(r["name"]), r["ticker"]))
+            if earn_rows:
+                earn_rows.sort(key=lambda x: x[0])
+                st.markdown("<div style='font-weight:600;color:#E5E2FF;margin:18px 0 6px'>다가오는 실적 발표 일정</div>", unsafe_allow_html=True)
+                st.caption("실적 발표 전후엔 주가가 크게 출렁일 수 있어요. 미리 알아두면 마음의 준비가 돼요. (예상 일정이라 바뀔 수 있어요.)")
+                for d, nm_, tkr in earn_rows[:12]:
+                    dd = (d - _today).days
+                    when = "오늘" if dd == 0 else (f"{dd}일 뒤" if dd <= 45 else "예정")
+                    st.markdown(
+                        f"<div style='display:flex;justify-content:space-between;font-size:13px;color:#C5C9E8;"
+                        f"margin:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);padding-bottom:3px'>"
+                        f"<span>{nm_} <span style='color:#8a90bf'>({tkr})</span></span>"
+                        f"<span style='color:#AFA9EC'>{d.strftime('%Y-%m-%d')} · {when}</span></div>",
+                        unsafe_allow_html=True)
+
             # ── (4) 분석 결과 CSV 내보내기 ──────────────────
             export_rows = []
             for r in ok:
@@ -491,6 +585,7 @@ if page == "내 포트폴리오 분석":
                     "업종": r.get("sector"), "PER": r.get("per"),
                     "현재가($)": r.get("current_price"), "목표가($)": r.get("target_mean"),
                     "상승여력(%)": r.get("upside_pct"), "수익률(%)": r.get("user_return_pct"),
+                    "배당수익률(%)": r.get("dividend_yield"), "52주위치(%)": r.get("week52_pos"),
                 })
             if export_rows:
                 import pandas as pd
@@ -672,6 +767,45 @@ elif page == "부자들은 요즘 뭘 샀나":
                         f"<div style='color:#8a90bf;font-size:11px'>{hd}</div></div>",
                         unsafe_allow_html=True)
                 st.caption("여러 큰손이 겹쳐 담을수록 위에 표시돼요. 13F는 분기 후 약 45일 뒤 공시라 실시간이 아니며, 투자 추천이 아닙니다.")
+
+                # ── 종목 하나 깊게: 왜 보유 + 전망 (클릭하면 로딩) ──
+                if api_key:
+                    opts = {}
+                    for x in shared:
+                        if x.get("ticker"):
+                            label = f"{x['name'].title()} ({x['ticker']})"
+                            opts[label] = x
+                    if opts:
+                        st.markdown("<div style='margin-top:12px;font-weight:600;color:#E5E2FF'>🔍 이 중 한 종목, 큰손들이 왜 들고 있는지 + 전망 보기</div>", unsafe_allow_html=True)
+                        pick_label = st.selectbox("종목 선택", ["(고르기)"] + list(opts.keys()),
+                                                  key="smr_thesis_pick", label_visibility="collapsed")
+                        if st.button("왜 보유 + 전망 분석", key="smr_thesis_btn"):
+                            if pick_label == "(고르기)":
+                                st.warning("먼저 종목을 골라주세요.")
+                            else:
+                                x = opts[pick_label]
+                                with st.spinner(f"{x['name'].title()}의 데이터·뉴스·전망을 모으는 중… (10~30초)"):
+                                    try:
+                                        _sc = score_stock(x["ticker"], None)
+                                    except Exception:
+                                        _sc = None
+                                    _nw = get_news(x["ticker"], limit=5)
+                                    _holders = [n.split(" (")[0] for n in x["holders"]]
+                                    _th, _therr = analyze_holding_thesis(
+                                        x["name"].title(), x["ticker"], _holders, _sc, _nw)
+                                st.session_state["smr_thesis"] = (pick_label, _th, _therr)
+                        th_state = st.session_state.get("smr_thesis")
+                        if th_state:
+                            tlabel, th, therr = th_state
+                            if therr:
+                                st.error(therr)
+                            elif th:
+                                st.markdown(
+                                    f"<div style='font-weight:700;color:#F4F5FF;margin:10px 0 4px'>🔍 {tlabel}</div>",
+                                    unsafe_allow_html=True)
+                                ai_text_box(th.get("text", ""), tone="green")
+                                policy_sources_expander(th)
+                                st.caption("큰손이 샀다고 좋은 종목이라는 뜻은 아니에요. 13F는 분기 뒤 공시라 지금은 다를 수 있어요.")
 
     # ── 두 투자자 포트폴리오 비교 ──────────────────────────
     with st.expander("🆚 두 투자자 포트폴리오 비교"):
@@ -1280,19 +1414,53 @@ elif page == "종목 검색":
         if details:
             st.caption("  ·  ".join(details))
 
-        # 20년 주가 차트
-        st.markdown("<div style='font-weight:500;color:#E5E2FF;margin:14px 0 4px'>주가 추이 (최근 20년 · 월별)</div>", unsafe_allow_html=True)
+        # 배당수익률
+        if r.get("dividend_yield") is not None:
+            st.markdown(
+                f"<div style='color:#C5C9E8;font-size:13px;margin:8px 0'>"
+                f"💰 배당수익률 <b style='color:#AFA9EC'>{r['dividend_yield']}%</b> "
+                f"<span style='color:#6E7396'>· 이 주식을 1년 들고 있을 때 받는 배당이 현재 주가의 몇 %인지예요. "
+                f"(0%면 배당을 거의 안 주는 회사예요.)</span></div>",
+                unsafe_allow_html=True)
+
+        # 52주 최고/최저 대비 현재 위치
+        if r.get("week52_pos") is not None:
+            pos = r["week52_pos"]
+            st.markdown(
+                f"<div style='margin:10px 0 6px'>"
+                f"<div style='font-weight:500;color:#E5E2FF;margin-bottom:4px'>52주 가격 위치</div>"
+                f"<div style='display:flex;justify-content:space-between;font-size:12px;color:#8a90bf;margin-bottom:3px'>"
+                f"<span>최저 ${r.get('week52_low')}</span>"
+                f"<span style='color:#AFA9EC'>현재 {pos}%</span>"
+                f"<span>최고 ${r.get('week52_high')}</span></div>"
+                f"<div style='background:rgba(255,255,255,0.06);border-radius:5px;height:10px'>"
+                f"<div style='width:{pos}%;height:100%;background:linear-gradient(90deg,#5DCAA5,#EF9F27,#F0997B);border-radius:5px'></div></div>"
+                f"<div style='color:#6E7396;font-size:12px;margin-top:3px'>0%면 최근 1년 중 가장 쌀 때, 100%면 가장 비쌀 때 근처예요. "
+                f"(높다고 나쁜 건 아니고, '지금 1년 범위 어디쯤'인지 감 잡는 용도예요.)</div></div>",
+                unsafe_allow_html=True)
+
+        # 주가 차트 (기간/주기 선택)
+        st.markdown("<div style='font-weight:500;color:#E5E2FF;margin:14px 0 4px'>주가 추이</div>", unsafe_allow_html=True)
+        RANGE_OPTS = {
+            "1개월 (일별)": ("1mo", "1d"),
+            "6개월 (일별)": ("6mo", "1d"),
+            "1년 (일별)": ("1y", "1d"),
+            "5년 (주별)": ("5y", "1wk"),
+            "20년 (월별)": ("20y", "1mo"),
+        }
+        sel = st.radio("차트 기간", list(RANGE_OPTS.keys()), index=4,
+                       horizontal=True, key="sf_chart_range", label_visibility="collapsed")
+        _period, _interval = RANGE_OPTS[sel]
         with st.spinner("차트 데이터 불러오는 중..."):
-            dates, closes = get_price_history(tk, period="20y")
+            dates, closes = get_price_history(tk, period=_period, interval=_interval)
         if dates:
             import pandas as pd
             df = pd.DataFrame({"종가($)": closes}, index=dates)
             st.line_chart(df, color="#7F77DD", height=280)
             chg = (closes[-1] / closes[0] - 1) * 100 if closes[0] else 0
-            yrs = len(dates) / 12
-            st.caption(f"{dates[0]} ${closes[0]:,.2f} → {dates[-1]} ${closes[-1]:,.2f}  ·  약 {yrs:.0f}년간 {chg:+,.0f}%")
+            st.caption(f"{dates[0]} ${closes[0]:,.2f} → {dates[-1]} ${closes[-1]:,.2f}  ·  {sel} 기준 {chg:+,.0f}%")
         else:
-            st.caption("차트 데이터를 불러오지 못했어요.")
+            st.caption("이 기간의 차트 데이터를 불러오지 못했어요. 다른 기간 버튼을 눌러보세요.")
 
         # 애널리스트 의견
         if r.get("analyst_rec") or r.get("target_mean"):
@@ -1392,118 +1560,243 @@ elif page == "미국 정부·정책 분석":
     if not api_key:
         st.warning("이 기능은 AI 검색을 사용해요. 왼쪽 사이드바에 Gemini API 키를 먼저 넣어주세요.")
     else:
-        c1, c2 = st.columns([4, 1])
-        with c1:
-            focus = st.text_input(
-                "관심 분야",
-                placeholder="예: 반도체, AI 인프라, 관세, 에너지, 방산 … (비워두면 전반적 동향)",
-                label_visibility="collapsed")
-        with c2:
-            do_policy = st.button("분석하기", type="primary", use_container_width=True)
-        st.caption("AI가 직접 웹을 검색하므로 답변까지 10~30초쯤 걸릴 수 있어요. 검색 결과에 따라 내용이 매번 조금씩 달라집니다.")
+        tab_pol, tab_tl, tab_rmk = st.tabs(["📈 정책 동향", "🏛️ 분야별 4년 흐름", "🗣️ 대통령 발언"])
 
-        if do_policy:
-            with st.spinner("최근 미국 정부 정책을 웹에서 찾아 분석하는 중…"):
-                data, err = analyze_government_policy(focus)
-            if err:
-                st.error(err)
-            else:
-                st.session_state["policy_data"] = data
-                st.session_state["policy_focus"] = focus.strip()
-                st.session_state.pop("policy_pick", None)  # 이전 종목 선택 초기화
+        # ── 탭 1: 정책 동향 (관심 분야 입력) ─────────────────
+        with tab_pol:
+            st.caption("관심 분야를 고르거나 직접 적으면, 최근 미국 정부 정책 동향과 영향받을 산업·종목을 정리해드려요. (비워두면 전반적 동향)")
 
-        data = st.session_state.get("policy_data")
-        if data:
-            shown_focus = st.session_state.get("policy_focus")
-            if shown_focus:
-                st.markdown(
-                    f"<div style='color:#9BA0C4;font-size:13px;margin:4px 0 2px'>관심 분야: "
-                    f"<span style='color:#AFA9EC'>{shown_focus}</span></div>",
-                    unsafe_allow_html=True)
+            # 빠른 선택 칩
+            POLICY_TOPICS = ["전반적 동향", "반도체", "관세·무역", "금리·세금",
+                             "에너지", "방산·국방", "AI 규제", "헬스케어"]
+            pt_cols = st.columns(4)
+            topic_click = None
+            for i, t in enumerate(POLICY_TOPICS):
+                if pt_cols[i % 4].button(t, key=f"policy_topic_{i}", use_container_width=True):
+                    topic_click = "" if t == "전반적 동향" else t
 
-            st.subheader("최근 정책 동향과 영향 분석")
-            ai_text_box(data.get("text", ""), tone="purple")
+            c1, c2 = st.columns([4, 1])
+            with c1:
+                focus = st.text_input(
+                    "관심 분야",
+                    placeholder="또는 직접 입력 (예: 이민, 우주·항공, 노동시장 …)",
+                    label_visibility="collapsed", key="policy_focus_input")
+            with c2:
+                do_policy = st.button("분석하기", type="primary", use_container_width=True, key="policy_do")
+            st.caption("AI가 직접 웹을 검색하므로 10~30초쯤 걸릴 수 있어요. 결과는 매번 조금씩 달라집니다.")
 
-            # ── 출처 ─────────────────────────────────────
-            sources = data.get("sources") or []
-            queries = data.get("queries") or []
-            if sources or queries:
-                with st.expander(f"🔎 AI가 참고한 출처 {len(sources)}개 보기"):
-                    if queries:
-                        st.markdown(
-                            "<div style='color:#9BA0C4;font-size:12px;margin-bottom:6px'>AI 검색어: "
-                            + ", ".join(f"<span style='color:#AFA9EC'>{q}</span>" for q in queries)
-                            + "</div>", unsafe_allow_html=True)
-                    for s in sources:
-                        title = s.get("title") or s.get("uri")
-                        uri = s.get("uri")
-                        st.markdown(
-                            f"<div style='font-size:13px;margin:3px 0'>• "
-                            f"<a href='{uri}' target='_blank' style='color:#9BC4FF;text-decoration:none'>{title}</a></div>",
-                            unsafe_allow_html=True)
-            else:
-                st.caption("이번 분석에서는 표시할 출처를 가져오지 못했어요. (검색이 일어나지 않았을 수 있어요)")
-
-            # ── 정책 관련 종목 후보 → 누르면 점수 보기 ─────
-            policy_ticker_section(data.get("tickers") or [], key_prefix="policy_search",
-                                  names=data.get("ticker_names") or {})
-
-        # ════════════════════════════════════════════════════
-        # 대표 분야 빠르게 보기 (칩 클릭 → 최근 4년 타임라인)
-        # ════════════════════════════════════════════════════
-        st.divider()
-        st.subheader("또는, 대표 분야를 눌러 최근 4년 흐름 보기")
-        st.caption("미국 정부가 그 분야에서 최근 4년간 무슨 정책·발언을 했고, 어떤 영향을 줬는지 타임라인으로 정리해드려요.")
-
-        SECTORS = ["반도체", "AI 인프라", "에너지", "방산·국방",
-                   "제약·바이오", "관세·무역", "암호화폐", "전기차·배터리"]
-        sec_cols = st.columns(4)
-        for i, sec in enumerate(SECTORS):
-            if sec_cols[i % 4].button(sec, key=f"policy_sec_{i}", use_container_width=True):
-                with st.spinner(f"'{sec}' 분야의 최근 4년 정책 흐름을 웹에서 찾는 중…"):
-                    tdata, terr = analyze_sector_policy_timeline(sec)
-                if terr:
-                    st.session_state["policy_timeline_err"] = terr
-                    st.session_state.pop("policy_timeline_data", None)
+            run_focus = topic_click if topic_click is not None else (focus if do_policy else None)
+            if run_focus is not None:
+                with st.spinner("최근 미국 정부 정책을 웹에서 찾아 분석하는 중…"):
+                    data, err = analyze_government_policy(run_focus)
+                if err:
+                    st.session_state["policy_err"] = err
+                    st.session_state.pop("policy_data", None)
                 else:
-                    st.session_state["policy_timeline_data"] = tdata
-                    st.session_state["policy_timeline_sector"] = sec
-                    st.session_state.pop("policy_timeline_err", None)
-                    st.session_state.pop("policy_tl_pick", None)
+                    st.session_state["policy_data"] = data
+                    st.session_state["policy_focus"] = run_focus.strip()
+                    st.session_state.pop("policy_err", None)
+                    st.session_state.pop("policy_search_pick", None)
 
-        if st.session_state.get("policy_timeline_err"):
-            st.error(st.session_state["policy_timeline_err"])
+            if st.session_state.get("policy_err"):
+                st.error(st.session_state["policy_err"])
 
-        tdata = st.session_state.get("policy_timeline_data")
-        if tdata:
-            sec_name = st.session_state.get("policy_timeline_sector", "")
-            st.markdown(
-                f"<div style='font-size:20px;font-weight:700;color:#F4F5FF;margin:14px 0 4px'>"
-                f"🏛️ {sec_name} · 최근 4년 정책 타임라인</div>",
-                unsafe_allow_html=True)
-            ai_text_box(tdata.get("text", ""), tone="purple")
+            data = st.session_state.get("policy_data")
+            if data:
+                shown_focus = st.session_state.get("policy_focus")
+                if shown_focus:
+                    st.markdown(
+                        f"<div style='color:#9BA0C4;font-size:13px;margin:4px 0 2px'>관심 분야: "
+                        f"<span style='color:#AFA9EC'>{shown_focus}</span></div>",
+                        unsafe_allow_html=True)
+                st.subheader("최근 정책 동향과 영향 분석")
+                ai_text_box(data.get("text", ""), tone="purple")
+                policy_sources_expander(data)
+                policy_ticker_section(data.get("tickers") or [], key_prefix="policy_search",
+                                      names=data.get("ticker_names") or {})
 
-            tl_sources = tdata.get("sources") or []
-            tl_queries = tdata.get("queries") or []
-            if tl_sources or tl_queries:
-                with st.expander(f"🔎 AI가 참고한 출처 {len(tl_sources)}개 보기"):
-                    if tl_queries:
-                        st.markdown(
-                            "<div style='color:#9BA0C4;font-size:12px;margin-bottom:6px'>AI 검색어: "
-                            + ", ".join(f"<span style='color:#AFA9EC'>{q}</span>" for q in tl_queries)
-                            + "</div>", unsafe_allow_html=True)
-                    for s in tl_sources:
-                        title = s.get("title") or s.get("uri")
-                        uri = s.get("uri")
-                        st.markdown(
-                            f"<div style='font-size:13px;margin:3px 0'>• "
-                            f"<a href='{uri}' target='_blank' style='color:#9BC4FF;text-decoration:none'>{title}</a></div>",
-                            unsafe_allow_html=True)
+        # ── 탭 2: 분야별 최근 4년 흐름 ───────────────────────
+        with tab_tl:
+            st.caption("분야를 누르면, 미국 정부가 그 분야에서 최근 4년간 무슨 정책·발언을 했고 어떤 영향을 줬는지 타임라인으로 정리해드려요.")
+            SECTORS = ["반도체", "AI 인프라", "에너지", "방산·국방",
+                       "제약·바이오", "관세·무역", "암호화폐", "전기차·배터리"]
+            sec_cols = st.columns(4)
+            for i, sec in enumerate(SECTORS):
+                if sec_cols[i % 4].button(sec, key=f"policy_sec_{i}", use_container_width=True):
+                    with st.spinner(f"'{sec}' 분야의 최근 4년 정책 흐름을 웹에서 찾는 중…"):
+                        tdata, terr = analyze_sector_policy_timeline(sec)
+                    if terr:
+                        st.session_state["policy_timeline_err"] = terr
+                        st.session_state.pop("policy_timeline_data", None)
+                    else:
+                        st.session_state["policy_timeline_data"] = tdata
+                        st.session_state["policy_timeline_sector"] = sec
+                        st.session_state.pop("policy_timeline_err", None)
+                        st.session_state.pop("policy_tl_pick", None)
 
-            policy_ticker_section(tdata.get("tickers") or [], key_prefix="policy_tl",
-                                  names=tdata.get("ticker_names") or {})
+            if st.session_state.get("policy_timeline_err"):
+                st.error(st.session_state["policy_timeline_err"])
+
+            tdata = st.session_state.get("policy_timeline_data")
+            if tdata:
+                sec_name = st.session_state.get("policy_timeline_sector", "")
+                st.markdown(
+                    f"<div style='font-size:20px;font-weight:700;color:#F4F5FF;margin:14px 0 4px'>"
+                    f"🏛️ {sec_name} · 최근 4년 정책 타임라인</div>",
+                    unsafe_allow_html=True)
+                ai_text_box(tdata.get("text", ""), tone="purple")
+                policy_sources_expander(tdata)
+                policy_ticker_section(tdata.get("tickers") or [], key_prefix="policy_tl",
+                                      names=tdata.get("ticker_names") or {})
+
+        # ── 탭 3: 대통령 발언 모아보기 ───────────────────────
+        with tab_rmk:
+            st.caption("현 미국 대통령이 최근 공개적으로 한 발언을 출처와 함께 모아드려요. "
+                       "'정책 흐름'이 아니라 '대통령이 직접 한 말' 중심이에요. "
+                       "(가짜·왜곡 인용이 많은 주제라, 출처로 확인된 발언만 담았어요. 출처를 꼭 함께 확인하세요.)")
+
+            if st.button("📋 전체 발언 분야별로 모아보기", key="remarks_overview_btn",
+                         type="primary", use_container_width=True):
+                with st.spinner("대통령의 최근 발언을 웹에서 찾아 분야별로 정리하는 중…"):
+                    ov, ov_err = analyze_remarks_overview()
+                if ov_err:
+                    st.session_state["remarks_ov_err"] = ov_err
+                    st.session_state.pop("remarks_ov_data", None)
+                else:
+                    st.session_state["remarks_ov_data"] = ov
+                    st.session_state.pop("remarks_ov_err", None)
+                    st.session_state.pop("remarks_ov_pick", None)
+
+            if st.session_state.get("remarks_ov_err"):
+                st.error(st.session_state["remarks_ov_err"])
+
+            ov = st.session_state.get("remarks_ov_data")
+            if ov:
+                st.markdown(
+                    "<div style='font-size:20px;font-weight:700;color:#F4F5FF;margin:14px 0 4px'>"
+                    "🗣️ 분야별 발언 요약</div>", unsafe_allow_html=True)
+                ai_text_box(ov.get("text", ""), tone="purple")
+                policy_sources_expander(ov)
+                policy_ticker_section(ov.get("tickers") or [], key_prefix="remarks_ov",
+                                      names=ov.get("ticker_names") or {})
+
+            st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+            st.caption("특정 분야만 자세히 — 아래 분야를 누르면 그 분야 발언만 시기순으로 모아드려요.")
+            REMARK_SECTORS = ["반도체", "AI 인프라", "에너지", "방산·국방",
+                              "제약·바이오", "관세·무역", "암호화폐", "전기차·배터리"]
+            rs_cols = st.columns(4)
+            for i, sec in enumerate(REMARK_SECTORS):
+                if rs_cols[i % 4].button(sec, key=f"remarks_sec_{i}", use_container_width=True):
+                    with st.spinner(f"'{sec}' 분야 발언을 웹에서 찾는 중…"):
+                        rdata, rerr = analyze_remarks_sector(sec)
+                    if rerr:
+                        st.session_state["remarks_sec_err"] = rerr
+                        st.session_state.pop("remarks_sec_data", None)
+                    else:
+                        st.session_state["remarks_sec_data"] = rdata
+                        st.session_state["remarks_sec_name"] = sec
+                        st.session_state.pop("remarks_sec_err", None)
+                        st.session_state.pop("remarks_sec_pick", None)
+
+            if st.session_state.get("remarks_sec_err"):
+                st.error(st.session_state["remarks_sec_err"])
+
+            rdata = st.session_state.get("remarks_sec_data")
+            if rdata:
+                rsec = st.session_state.get("remarks_sec_name", "")
+                st.markdown(
+                    f"<div style='font-size:20px;font-weight:700;color:#F4F5FF;margin:14px 0 4px'>"
+                    f"🗣️ {rsec} · 대통령 발언 모음</div>", unsafe_allow_html=True)
+                ai_text_box(rdata.get("text", ""), tone="purple")
+                policy_sources_expander(rdata)
+                policy_ticker_section(rdata.get("tickers") or [], key_prefix="remarks_sec",
+                                      names=rdata.get("ticker_names") or {})
 
         st.caption("AI·웹검색 기반 교육용 분석이며, 투자 판단의 책임은 본인에게 있습니다.")
+
+
+elif page == "관심 많은 분야":
+    st.markdown(
+        "<div style='border-bottom:1px solid rgba(175,169,236,0.2);padding-bottom:14px;margin-bottom:18px'>"
+        "<div style='font-size:28px;font-weight:700;font-family:Orbitron,sans-serif;color:#F4F5FF;letter-spacing:0.5px;text-shadow:0 0 18px rgba(127,119,221,0.5)'>HOT THEMES</div>"
+        "<div style='color:#9BA0C4;font-size:14px;margin-top:4px'>요즘 미국 증시에서 관심·화제가 쏠리는 분야를 순위로 보여드려요. 각 분야에서 많이 거론되는 종목도 함께요.</div>"
+        "</div>", unsafe_allow_html=True)
+
+    st.markdown(
+        "<div style='background:rgba(240,153,123,0.08);border:0.5px solid rgba(240,153,123,0.3);"
+        "border-radius:10px;padding:12px 16px;margin-bottom:14px;color:#E5D5CC;font-size:13px;line-height:1.7'>"
+        "여기는 <b>'요즘 화제가 되는 분야'</b>를 정리한 것이지 <b>추천이 아니에요.</b> "
+        "특히 ⚠️ <b>관심이 많다 = 좋은 투자가 아니에요.</b> 화제가 몰린 분야는 이미 가격이 많이 올라 "
+        "<b>고평가·과열</b>일 수도 있어요. 인기는 '지금 무슨 얘기가 도는지' 참고용으로만 보세요."
+        "</div>", unsafe_allow_html=True)
+
+    if not api_key:
+        st.warning("이 기능은 AI 검색을 사용해요. 왼쪽 사이드바에 Gemini API 키를 먼저 넣어주세요.")
+    else:
+        sub_hot, sub_mine = st.tabs(["🔥 요즘 뜨는 분야", "🎯 내 관심 분야 고르기"])
+
+        # ── 서브탭 1: AI가 골라주는 요즘 뜨는 분야 ──
+        with sub_hot:
+            if st.button("🔥 요즘 관심 많은 분야 순위 보기", type="primary",
+                         use_container_width=True, key="trend_btn"):
+                with st.spinner("요즘 화제가 되는 분야를 웹에서 찾는 중… (10~30초)"):
+                    trdata, trerr = analyze_trending_sectors()
+                if trerr:
+                    st.session_state["trend_err"] = trerr
+                    st.session_state.pop("trend_data", None)
+                else:
+                    st.session_state["trend_data"] = trdata
+                    st.session_state.pop("trend_err", None)
+                    st.session_state.pop("trend_pick", None)
+            st.caption("AI가 직접 웹을 검색하므로 시간이 좀 걸려요. 결과는 매번 조금씩 달라집니다.")
+            if st.session_state.get("trend_err"):
+                st.error(st.session_state["trend_err"])
+            trdata = st.session_state.get("trend_data")
+            if trdata:
+                st.subheader("요즘 관심이 쏠리는 분야")
+                ai_text_box(trdata.get("text", ""), tone="purple")
+                policy_sources_expander(trdata)
+                policy_ticker_section(trdata.get("tickers") or [], key_prefix="trend",
+                                      names=trdata.get("ticker_names") or {})
+
+        # ── 서브탭 2: 내가 직접 고른 분야 ──
+        with sub_mine:
+            st.caption("궁금한 분야를 눌러보세요. 그 분야에서 요즘 거론되는 종목과 이유를 정리해드려요.")
+            MY_SECTORS = ["반도체", "AI 인프라", "에너지", "방산·국방",
+                          "제약·바이오", "관세·무역", "암호화폐", "전기차·배터리",
+                          "원자력", "로봇·자동화", "우주·항공", "금융·은행"]
+            ms_cols = st.columns(4)
+            clicked = None
+            for i, sec in enumerate(MY_SECTORS):
+                if ms_cols[i % 4].button(sec, key=f"myfocus_sec_{i}", use_container_width=True):
+                    clicked = sec
+            typed = st.text_input("또는 직접 입력", key="myfocus_text",
+                                  label_visibility="collapsed",
+                                  placeholder="또는 직접 입력 (예: 비만치료제, 데이터센터 …)")
+            if st.button("입력한 분야 살펴보기", key="myfocus_btn") and typed.strip():
+                clicked = typed.strip()
+            if clicked:
+                st.session_state["myfocus_q"] = clicked
+                with st.spinner(f"'{clicked}' 분야를 웹에서 살펴보는 중… (10~30초)"):
+                    fdata, ferr = analyze_sector_focus(clicked)
+                if ferr:
+                    st.session_state["myfocus_err"] = ferr
+                    st.session_state.pop("myfocus_data", None)
+                else:
+                    st.session_state["myfocus_data"] = fdata
+                    st.session_state.pop("myfocus_err", None)
+                    st.session_state.pop("myfocus_pick", None)
+            if st.session_state.get("myfocus_err"):
+                st.error(st.session_state["myfocus_err"])
+            fdata = st.session_state.get("myfocus_data")
+            if fdata:
+                st.subheader(f"🎯 {st.session_state.get('myfocus_q','')} · 요즘 거론되는 종목")
+                ai_text_box(fdata.get("text", ""), tone="purple")
+                policy_sources_expander(fdata)
+                policy_ticker_section(fdata.get("tickers") or [], key_prefix="myfocus",
+                                      names=fdata.get("ticker_names") or {})
+
+        st.caption("AI·웹검색 기반 교육용 정리이며, 투자 판단의 책임은 본인에게 있습니다.")
 
 
 st.divider()
