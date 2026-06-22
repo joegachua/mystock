@@ -35,5 +35,14 @@ def get_news(ticker, limit=4):
         pub = c.get("pubDate") or c.get("displayTime")
         if pub:
             when = str(pub)[:10]
-        out.append({"title": title, "publisher": publisher, "link": link, "time": when})
+        # 본문 요약(있으면) — AI가 '무슨 일이 왜 일어났는지'를 파악하는 데 쓴다
+        summary = c.get("summary") or c.get("description") or ""
+        if isinstance(summary, str):
+            summary = summary.strip()
+            if len(summary) > 600:        # 너무 길면 잘라 토큰 절약
+                summary = summary[:600] + "…"
+        else:
+            summary = ""
+        out.append({"title": title, "publisher": publisher, "link": link,
+                    "time": when, "summary": summary})
     return out
