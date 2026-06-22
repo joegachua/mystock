@@ -138,6 +138,39 @@ def score_stock(ticker, user_return_pct=None):
             (dte_score, 0.30),
         ])
 
+    # ===== 추가 지표: 배당 / 52주 위치 / 실적 발표일 =====
+    # 배당수익률(%) — yfinance 버전에 따라 비율(0.012)/퍼센트(1.2)가 섞여 와서 보정
+    dy = info.get("dividendYield")
+    if dy is None:
+        dy = info.get("trailingAnnualDividendYield")
+    if dy is not None:
+        try:
+            dy = float(dy)
+            if 0 < dy < 1:          # 0.012 같은 '비율'이면 퍼센트로 환산
+                dy *= 100
+            if 0 < dy < 100:
+                result["dividend_yield"] = round(dy, 2)
+        except (TypeError, ValueError):
+            pass
+
+    # 52주 최고/최저 대비 현재 위치 (0=1년 최저, 100=1년 최고)
+    hi = info.get("fiftyTwoWeekHigh")
+    lo = info.get("fiftyTwoWeekLow")
+    if price and hi and lo and hi > lo:
+        result["week52_high"] = round(hi, 2)
+        result["week52_low"] = round(lo, 2)
+        result["week52_pos"] = int(round(clamp((price - lo) / (hi - lo) * 100)))
+
+    # 다음(예상) 실적 발표일 — 있을 때만
+    ets = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
+    if ets:
+        try:
+            import datetime as _dt
+            result["earnings_date"] = _dt.datetime.fromtimestamp(
+                int(ets), _dt.timezone.utc).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+
     return result
 
 if __name__ == "__main__":
