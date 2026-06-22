@@ -1,9 +1,9 @@
 import streamlit as st
 from score_engine import score_stock as _score_stock
-from ai_explain import init_client, explain_stock, summarize_news, extract_holdings_from_images, summarize_insider
+from ai_explain import init_client, explain_stock, summarize_news, extract_holdings_from_images, summarize_insider, analyze_government_policy, analyze_sector_policy_timeline, diagnose_portfolio
 from news_fetch import get_news as _get_news
 from insider_fetch import get_insider_trades as _get_insider_trades
-from superinvestor_fetch import get_13f_holdings as _get_13f_holdings, SUPER_INVESTORS, guess_ticker as _guess_ticker
+from superinvestor_fetch import get_13f_holdings as _get_13f_holdings, SUPER_INVESTORS, guess_ticker as _guess_ticker, get_13f_comparison as _get_13f_comparison
 from stock_search import search_ticker as _search_ticker, get_price_history as _get_price_history
 
 # ── 캐싱 래퍼 ──────────────────────────────────────────────
@@ -31,6 +31,36 @@ def get_insider_trades(ticker, limit=8):
 @st.cache_data(ttl=3600, show_spinner=False)  # 13F: 1시간 (분기마다 바뀌므로 길게)
 def get_13f_holdings(cik, top_n=None):
     return _get_13f_holdings(cik, top_n)
+
+@st.cache_data(ttl=3600, show_spinner=False)  # 13F 분기 비교: 1시간
+def get_13f_comparison(cik):
+    return _get_13f_comparison(cik)
+
+@st.cache_data(ttl=3600, show_spinner=False)  # 스마트머니 랭킹: 1시간
+def compute_smart_money_ranking(top_each=20):
+    """등록된 모든 슈퍼투자자의 최신 13F 상위 종목을 모아, 같은 종목을 몇 명이
+    공통으로 보유했는지 집계한다. 반환: [{ticker, name, holders[], count, total_value}, ...]
+    (보유한 투자자 수 → 총 보유금액 순 내림차순)"""
+    agg = {}  # 티커(없으면 정규화 이름) -> 집계
+    for inv, cik in SUPER_INVESTORS.items():
+        _rd, holdings = get_13f_holdings(cik, top_each)   # 캐싱됨
+        if not holdings:
+            continue
+        for h in holdings:
+            tk = guess_ticker(h["name"])                  # 캐싱됨
+            key = tk or h["name"].upper()
+            if key not in agg:
+                agg[key] = {"ticker": tk or "", "name": h["name"],
+                            "holders": set(), "value": 0}
+            agg[key]["holders"].add(inv)
+            agg[key]["value"] += h.get("value", 0)
+    out = []
+    for v in agg.values():
+        out.append({"ticker": v["ticker"], "name": v["name"],
+                    "holders": sorted(v["holders"]),
+                    "count": len(v["holders"]), "total_value": v["value"]})
+    out.sort(key=lambda x: (x["count"], x["total_value"]), reverse=True)
+    return out
 
 @st.cache_data(ttl=86400, show_spinner=False) # 회사명→티커 매칭: 하루
 def guess_ticker(company_name):
@@ -158,10 +188,80 @@ header[data-testid="stHeader"] { background: transparent !important; }
 def clean_name(name):
     return name.replace("*", "").strip() if name else name
 
+def ai_text_box(text, tone="purple"):
+    """AI 생성 텍스트를 통일된 스타일의 박스로 표시한다. tone: purple(기본)/green/orange"""
+    if not text:
+        return
+    safe = text.replace("#", "").replace("**", "").replace("\n", "<br>")
+    tones = {
+        "purple": ("rgba(127,119,221,0.12)", "rgba(175,169,236,0.3)"),
+        "green":  ("rgba(93,202,165,0.10)",  "rgba(93,202,165,0.3)"),
+        "orange": ("rgba(240,153,123,0.10)", "rgba(240,153,123,0.3)"),
+    }
+    bg, border = tones.get(tone, tones["purple"])
+    st.markdown(
+        f"<div style='background:{bg};border:0.5px solid {border};border-radius:10px;"
+        f"padding:14px 16px;margin:8px 0;color:#E5E2FF;font-size:14px;line-height:1.85'>{safe}</div>",
+        unsafe_allow_html=True)
+
+
+def policy_ticker_section(tickers, key_prefix, names=None):
+    """정책 분석에서 나온 관련 종목 후보를 버튼으로 보여주고, 누르면 점수 카드를 표시한다.
+    검색 결과와 분야 타임라인이 공통으로 사용한다. key_prefix로 위젯/세션 키를 분리한다.
+    names: {티커: 영어 회사명} (있으면 버튼에 함께 표시)."""
+    names = names or {}
+    if not tickers:
+        st.caption("이번 분석에서는 직접 관련된 개별 종목이 특정되지 않았어요.")
+        return
+    st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
+    st.subheader("정책과 관련해 언급된 종목")
+    st.caption("AI가 위 분석에서 언급한 종목이에요. 눌러보면 이 앱의 점수·지표로 살펴볼 수 있어요. (추천이 아닙니다)")
+    cols = st.columns(2)
+    for i, tk in enumerate(tickers):
+        eng = names.get(tk, "")
+        label = f"{tk} · {eng}" if eng else tk
+        if cols[i % 2].button(label, key=f"{key_prefix}_btn_{tk}", use_container_width=True):
+            st.session_state[f"{key_prefix}_pick"] = tk
+            st.session_state.pop(f"{key_prefix}_pick_ai", None)
+
+    pick = st.session_state.get(f"{key_prefix}_pick")
+    if not pick:
+        return
+    st.divider()
+    r = None
+    try:
+        with st.spinner(f"{pick} 분석 중…"):
+            r = score_stock(pick, None)
+    except Exception:
+        r = None
+    if not r:
+        st.warning(f"{pick} 데이터를 가져오지 못했어요. 잠시 후 다시 시도하거나 '종목 검색' 탭에서 찾아보세요.")
+        return
+    nm = clean_name(r.get("name", pick))
+    tag = "ETF" if r.get("is_etf") else "개별주"
+    st.markdown(f"#### {pick} · {nm} ({tag})")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("수익성 점수", f"{r.get('profit_score','-')}/100")
+    m2.metric("안정성 점수", f"{r.get('stability_score','-')}/100")
+    if r.get("current_price") is not None:
+        m3.metric("현재가", f"${r.get('current_price')}")
+    bits = []
+    if r.get("per") is not None: bits.append(f"PER {r['per']}")
+    if r.get("analyst_rec"): bits.append(f"애널리스트 의견: {r['analyst_rec']}")
+    if r.get("upside_pct") is not None: bits.append(f"목표가 상승여력 {r['upside_pct']}%")
+    if bits:
+        st.caption(" · ".join(str(b) for b in bits))
+    if f"{key_prefix}_pick_ai" not in st.session_state:
+        with st.spinner("AI가 이 종목을 설명하는 중…"):
+            st.session_state[f"{key_prefix}_pick_ai"] = explain_stock(r)
+    ai_text_box(st.session_state.get(f"{key_prefix}_pick_ai", ""), tone="green")
+    st.caption("더 자세히 보려면 '종목 검색' 탭에서 같은 티커를 검색해보세요.")
+
+
 # ===== 사이드바: 메뉴 + Gemini API 키 =====
 with st.sidebar:
     st.markdown("### 메뉴")
-    page = st.radio("페이지 선택", ["내 포트폴리오 분석", "부자들은 요즘 뭘 샀나", "종목 검색"],
+    page = st.radio("페이지 선택", ["내 포트폴리오 분석", "부자들은 요즘 뭘 샀나", "종목 검색", "미국 정부·정책 분석"],
                     label_visibility="collapsed")
     st.divider()
     st.markdown("### 설정")
@@ -184,6 +284,8 @@ if page == "내 포트폴리오 분석":
 
     with st.expander("포트폴리오 캡처로 자동 입력 (토스 등)"):
         st.caption("캡처에 종목명과 수익률이 보이게 찍어주세요. 여러 장도 가능합니다.")
+        st.caption("💡 팁: 영어 티커(AAPL, NVDA)가 보이게 캡처하면 인식이 더 정확해요. "
+                   "토스에서 종목을 누르면 상세 화면에 티커가 나옵니다.")
         uploaded = st.file_uploader("캡처 이미지", type=["png", "jpg", "jpeg"],
                                     accept_multiple_files=True, label_visibility="collapsed")
         if st.button("이미지에서 종목 인식"):
@@ -194,36 +296,59 @@ if page == "내 포트폴리오 분석":
             else:
                 with st.spinner("AI가 캡처에서 종목을 읽는 중..."):
                     imgs = [f.read() for f in uploaded]
-                    data, err = extract_holdings_from_images(imgs)
+                    result, err = extract_holdings_from_images(imgs)
                 if err:
                     st.error(err)
-                elif data:
+                elif result:
+                    import yfinance as yf
+                    from stock_search import korean_name
+                    holdings = result.get("holdings", [])
+                    unresolved = result.get("unresolved", [])
                     rows = []
-                    for d in data:
-                        rows.append({"티커": d.get("ticker", ""), "수익률(%)": d.get("return_pct")})
+                    with st.spinner("인식한 종목을 확인하는 중..."):
+                        for d in holdings:
+                            tk = d.get("ticker", "")
+                            # 한글명 우선, 없으면 정식 영문명
+                            kr = korean_name(tk)
+                            nm = d.get("name", "")
+                            try:
+                                info = yf.Ticker(tk).info
+                                if info.get("shortName"):
+                                    nm = info.get("shortName")
+                            except Exception:
+                                pass
+                            rows.append({"티커": tk, "한글명": kr or "", "종목명": nm, "수익률(%)": d.get("return_pct")})
                     st.session_state["holdings_df"] = rows
-                    st.success(f"{len(data)}개 종목을 인식했어요. 아래 표에 채웠으니 확인 후 수정하세요.")
+                    msg = f"{len(rows)}개 종목을 인식했어요. 아래 표에서 확인하고 수정하세요."
+                    if unresolved:
+                        msg += f"\n\n⚠️ 티커를 못 찾은 종목: {', '.join(unresolved)}. 표에 직접 추가해주세요."
+                    st.success(msg)
                     st.rerun()
 
     import pandas as pd
     default_rows = st.session_state.get("holdings_df", [
-        {"티커": "NVDA", "수익률(%)": 17.3},
-        {"티커": "TEVA", "수익률(%)": 102.5},
-        {"티커": "NVO", "수익률(%)": -24.5},
-        {"티커": "GOOGL", "수익률(%)": 30.9},
-        {"티커": "SPY", "수익률(%)": 22.2},
-        {"티커": "CPNG", "수익률(%)": -6.1},
+        {"티커": "NVDA", "한글명": "엔비디아", "종목명": "NVIDIA", "수익률(%)": 17.3},
+        {"티커": "TEVA", "한글명": "테바", "종목명": "Teva", "수익률(%)": 102.5},
+        {"티커": "NVO", "한글명": "노보노디스크", "종목명": "Novo Nordisk", "수익률(%)": -24.5},
+        {"티커": "GOOGL", "한글명": "알파벳(구글)", "종목명": "Alphabet", "수익률(%)": 30.9},
+        {"티커": "SPY", "한글명": "S&P500(SPY)", "종목명": "SPDR S&P 500", "수익률(%)": 22.2},
+        {"티커": "CPNG", "한글명": "쿠팡", "종목명": "Coupang", "수익률(%)": -6.1},
     ])
+    df_init = pd.DataFrame(default_rows)
+    df_init.index = range(1, len(df_init) + 1)
+    df_init.index.name = "No."
     editor_ver = st.session_state.get("editor_ver", 0)
     edited = st.data_editor(
-        pd.DataFrame(default_rows),
+        df_init,
         num_rows="dynamic",
         use_container_width=True,
-        hide_index=True,
-        column_order=["티커", "수익률(%)"],
+        hide_index=False,
+        column_order=["티커", "한글명", "종목명", "수익률(%)"],
         column_config={
-            "티커": st.column_config.TextColumn("티커", help="예: NVDA", width="large", pinned=True),
-            "수익률(%)": st.column_config.NumberColumn("수익률 (%)", help="토스에서 보이는 총 수익률", format="%.1f", width="large"),
+            "티커": st.column_config.TextColumn("티커", help="예: NVDA", width="small", pinned=True),
+            "한글명": st.column_config.TextColumn("한글명", help="한국어 종목 이름", width="medium"),
+            "종목명": st.column_config.TextColumn("종목명(영문)", help="정식 회사 이름", width="medium"),
+            "수익률(%)": st.column_config.NumberColumn("수익률 (%)", help="토스에서 보이는 총 수익률", format="%.1f", width="small"),
         },
         key=f"holdings_editor_{editor_ver}",
     )
@@ -247,6 +372,7 @@ if page == "내 포트폴리오 분석":
                 ret_val = None
             try:
                 r = score_stock(ticker, ret_val)
+                r["user_return_pct"] = ret_val
                 results.append(r)
             except Exception as e:
                 results.append({"ticker": ticker, "name": ticker, "error": str(e)})
@@ -254,6 +380,7 @@ if page == "내 포트폴리오 분석":
         progress.empty()
         st.session_state["results"] = results
         st.session_state["my_tickers"] = [r["ticker"] for r in results if "error" not in r]
+        st.session_state.pop("pf_diag", None)  # 새 분석이면 진단도 다시
 
     def total_score(r):
         return ((r.get("profit_score") or 0) + (r.get("stability_score") or 0)) / 2
@@ -271,6 +398,106 @@ if page == "내 포트폴리오 분석":
             c1.metric("분석 종목 수", f"{len(ok)}개")
             c2.metric("평균 수익성", f"{avg_p} / 100")
             c3.metric("평균 안정성", f"{avg_s} / 100")
+
+            # 수익률 요약 (입력된 수익률 기준)
+            rets = [r.get("user_return_pct") for r in ok if r.get("user_return_pct") is not None]
+            if rets:
+                avg_ret = sum(rets) / len(rets)
+                plus_cnt = sum(1 for x in rets if x > 0)
+                minus_cnt = sum(1 for x in rets if x < 0)
+                d1, d2, d3 = st.columns(3)
+                ret_color = "🔴" if avg_ret > 0 else ("🔵" if avg_ret < 0 else "⚪")
+                d1.metric("평균 수익률", f"{avg_ret:+.1f}%",
+                          help="입력한 종목들의 수익률 평균이에요. (투자 금액 차이는 반영 안 됨)")
+                d2.metric("수익 종목", f"{plus_cnt}개", help="플러스(+) 수익을 낸 종목 수")
+                d3.metric("손실 종목", f"{minus_cnt}개", help="마이너스(-) 손실을 본 종목 수")
+                st.caption(f"💡 입력한 {len(rets)}개 종목 중 {plus_cnt}개가 플러스, {minus_cnt}개가 마이너스예요. "
+                           f"평균적으로 {abs(avg_ret):.1f}% {'수익' if avg_ret > 0 else '손실'} 상태입니다. "
+                           "(각 종목에 얼마씩 넣었는지는 반영되지 않은 단순 평균이에요.)")
+            st.divider()
+
+            # ── (1) 포트폴리오 한 줄 진단 (AI) ──────────────
+            if api_key:
+                if st.button("🩺 내 포트폴리오 진단받기 (AI 한 줄 평)"):
+                    sec_counts = {}
+                    for r in ok:
+                        s = r.get("sector") or "기타/미분류"
+                        sec_counts[s] = sec_counts.get(s, 0) + 1
+                    summary = {
+                        "avg_profit": avg_p, "avg_stability": avg_s,
+                        "avg_return": (sum(rets) / len(rets)) if rets else None,
+                        "sectors": sorted(sec_counts.items(), key=lambda x: x[1], reverse=True),
+                        "stocks": [(clean_name(r["name"]), round(total_score(r))) for r in ok],
+                    }
+                    with st.spinner("AI가 포트폴리오 성격을 진단 중…"):
+                        st.session_state["pf_diag"] = diagnose_portfolio(summary)
+                if "pf_diag" in st.session_state:
+                    ai_text_box(st.session_state["pf_diag"], tone="purple")
+
+            # ── (2) 업종(섹터) 분포 ─────────────────────────
+            sec_counts = {}
+            for r in ok:
+                s = r.get("sector") or "기타/미분류"
+                sec_counts[s] = sec_counts.get(s, 0) + 1
+            if sec_counts:
+                st.markdown("<div style='font-weight:600;color:#E5E2FF;margin:16px 0 6px'>업종 분포</div>", unsafe_allow_html=True)
+                total_n = sum(sec_counts.values())
+                palette = ["#7F77DD", "#5DCAA5", "#F0997B", "#9BC4FF", "#EF9F27", "#C77DFF", "#5BC0BE", "#E8896B"]
+                for i, (sec, cnt) in enumerate(sorted(sec_counts.items(), key=lambda x: x[1], reverse=True)):
+                    pct = cnt / total_n * 100
+                    color = palette[i % len(palette)]
+                    st.markdown(
+                        f"<div style='margin:4px 0'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:13px;color:#C5C9E8;margin-bottom:2px'>"
+                        f"<span>{sec}</span><span>{cnt}종목 ({pct:.0f}%)</span></div>"
+                        f"<div style='background:rgba(255,255,255,0.06);border-radius:5px;height:9px'>"
+                        f"<div style='width:{pct}%;height:100%;background:{color};border-radius:5px'></div></div></div>",
+                        unsafe_allow_html=True)
+                if len(sec_counts) == 1:
+                    st.caption("⚠️ 한 업종에 집중돼 있어요. 분산 효과는 제한적일 수 있어요.")
+
+            # ── (3) 목표가 도달 현황 (애널리스트 목표가 대비 현재가) ──
+            reach_rows = []
+            for r in ok:
+                cp, tm = r.get("current_price"), r.get("target_mean")
+                if cp and tm:
+                    reach = cp / tm * 100  # 현재가가 목표가의 몇 %
+                    reach_rows.append((clean_name(r["name"]), r["ticker"], cp, tm, reach))
+            if reach_rows:
+                st.markdown("<div style='font-weight:600;color:#E5E2FF;margin:18px 0 6px'>목표가 도달 현황</div>", unsafe_allow_html=True)
+                st.caption("애널리스트 평균 목표주가 대비 현재가 위치예요. 100% 미만이면 목표가까지 상승 여력이, 100% 이상이면 목표가를 넘어선 상태예요.")
+                reach_rows.sort(key=lambda x: x[4])
+                for nm_, tkr, cp, tm, reach in reach_rows:
+                    bar_w = max(0, min(100, reach))   # 막대는 0~100%로 시각화
+                    over = reach >= 100
+                    color = "#F0997B" if over else "#5DCAA5"
+                    note = "목표가 초과" if over else f"여력 {100-reach:.0f}%"
+                    st.markdown(
+                        f"<div style='margin:5px 0'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:13px;color:#C5C9E8;margin-bottom:2px'>"
+                        f"<span>{nm_} <span style='color:#8a90bf'>({tkr})</span></span>"
+                        f"<span>{reach:.0f}% · {note}</span></div>"
+                        f"<div style='background:rgba(255,255,255,0.06);border-radius:5px;height:9px'>"
+                        f"<div style='width:{bar_w}%;height:100%;background:{color};border-radius:5px'></div></div></div>",
+                        unsafe_allow_html=True)
+
+            # ── (4) 분석 결과 CSV 내보내기 ──────────────────
+            export_rows = []
+            for r in ok:
+                export_rows.append({
+                    "티커": r["ticker"], "종목명": clean_name(r["name"]),
+                    "종합점수": round(total_score(r)),
+                    "수익성": r.get("profit_score"), "안정성": r.get("stability_score"),
+                    "업종": r.get("sector"), "PER": r.get("per"),
+                    "현재가($)": r.get("current_price"), "목표가($)": r.get("target_mean"),
+                    "상승여력(%)": r.get("upside_pct"), "수익률(%)": r.get("user_return_pct"),
+                })
+            if export_rows:
+                import pandas as pd
+                csv_bytes = pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8-sig")
+                st.download_button("📥 분석 결과 CSV로 저장", data=csv_bytes,
+                                   file_name="portfolio_analysis.csv", mime="text/csv")
+
             st.divider()
 
         st.subheader("종목별 점수 (높은 순)")
@@ -278,7 +505,16 @@ if page == "내 포트폴리오 분석":
             tag = "ETF" if r.get("is_etf") else "개별주"
             total = round(total_score(r))
             name = clean_name(r["name"])
-            with st.expander(f"{name}  ·  {tag}  ·  종합 {total}점"):
+            exp_key = f"explain_{r['ticker']}_{idx}"
+            sum_key = f"newsum_{r['ticker']}_{idx}"
+            insum_key = f"inssum_{r['ticker']}_{idx}"
+            # 본 항목들을 제목 옆에 나란히 체크 표시
+            badges = []
+            if exp_key in st.session_state: badges.append("AI")
+            if sum_key in st.session_state: badges.append("뉴스")
+            if insum_key in st.session_state: badges.append("내부자")
+            seen_badge = ("  ✅ " + "·".join(badges)) if badges else ""
+            with st.expander(f"{name}  ·  {tag}  ·  종합 {total}점{seen_badge}"):
                 m1, m2 = st.columns(2)
                 m1.metric("수익성", f"{r.get('profit_score', '—')} / 100")
                 m2.metric("안정성", f"{r.get('stability_score', '—')} / 100")
@@ -308,32 +544,32 @@ if page == "내 포트폴리오 분석":
                         f"<div style='color:#C5C9E8;font-size:14px;line-height:1.8'>{joined}</div>",
                         unsafe_allow_html=True)
 
-                exp_key = f"explain_{r['ticker']}_{idx}"
-                if st.button("AI 설명 보기", key=f"btn_{exp_key}"):
+                btn_label = "AI 설명 다시 보기" if exp_key in st.session_state else "AI 설명 보기"
+                if st.button(btn_label, key=f"btn_{exp_key}"):
                     if not api_key:
                         st.warning("왼쪽 사이드바에 Gemini API 키를 먼저 넣어주세요.")
                     else:
                         with st.spinner("AI가 설명을 작성 중..."):
                             st.session_state[exp_key] = explain_stock(r)
+                            st.rerun()
                 if exp_key in st.session_state:
-                    safe_text = st.session_state[exp_key].replace("#", "").replace("**", "")
-                    safe_text = safe_text.replace("\n", "<br>")
-                    st.markdown(
-                        f"<div style='background:rgba(127,119,221,0.12);border:0.5px solid rgba(175,169,236,0.3);border-radius:10px;padding:14px 16px;color:#E5E2FF;font-size:14px;line-height:1.8'>{safe_text}</div>",
-                        unsafe_allow_html=True)
+                    ai_text_box(st.session_state[exp_key], tone="purple")
 
-                st.markdown("**최신 뉴스**")
+                # 최신 뉴스
+                sum_key = f"newsum_{r['ticker']}_{idx}"
+                st.markdown(f"<div style='font-weight:600;color:#E5E2FF;margin-top:14px;font-size:15px'>최신 뉴스</div>", unsafe_allow_html=True)
                 news_items = get_news(r["ticker"], limit=10)
                 if news_items:
-                    sum_key = f"newsum_{r['ticker']}_{idx}"
-                    if st.button("뉴스 핵심 요약", key=f"sumbtn_{sum_key}"):
+                    nsum_label = "뉴스 요약 다시 보기" if sum_key in st.session_state else "뉴스 핵심 요약"
+                    if st.button(nsum_label, key=f"sumbtn_{sum_key}"):
                         if not api_key:
                             st.warning("왼쪽 사이드바에 Gemini API 키를 먼저 넣어주세요.")
                         else:
                             with st.spinner("AI가 뉴스를 요약 중..."):
-                                st.session_state[sum_key] = summarize_news(clean_name(r["name"]), news_items)
+                                st.session_state[sum_key] = summarize_news(clean_name(r["name"]), news_items, r["ticker"])
+                                st.rerun()
                     if sum_key in st.session_state:
-                        st.success(st.session_state[sum_key])
+                        ai_text_box(st.session_state[sum_key], tone="purple")
 
                     with st.expander(f"뉴스 전체 보기 ({len(news_items)}건)"):
                         for n in news_items:
@@ -347,24 +583,27 @@ if page == "내 포트폴리오 분석":
 
                 if not r.get("is_etf"):
                     ins_key = f"insider_{r['ticker']}_{idx}"
-                    st.markdown("<div style='font-weight:500;color:#E5E2FF;margin-top:10px'>내부자 거래 (임원·이사)</div>", unsafe_allow_html=True)
+                    insum_key = f"inssum_{r['ticker']}_{idx}"
+                    st.markdown(f"<div style='font-weight:600;color:#E5E2FF;margin-top:14px;font-size:15px'>내부자 거래 (임원·이사)</div>", unsafe_allow_html=True)
                     if st.button("내부자 거래 보기", key=f"insbtn_{ins_key}"):
                         with st.spinner("SEC에서 내부자 거래를 불러오는 중..."):
                             st.session_state[ins_key] = get_insider_trades(r["ticker"], limit=8)
+                            st.rerun()
                     if ins_key in st.session_state:
                         trades = st.session_state[ins_key]
                         if not trades:
                             st.caption("최근 내부자 거래 기록이 없어요.")
                         else:
-                            insum_key = f"inssum_{r['ticker']}_{idx}"
-                            if st.button("내부자 거래 핵심 요약", key=f"inssumbtn_{insum_key}"):
+                            insum_label = "내부자 요약 다시 보기" if insum_key in st.session_state else "내부자 거래 핵심 요약"
+                            if st.button(insum_label, key=f"inssumbtn_{insum_key}"):
                                 if not api_key:
                                     st.warning("왼쪽 사이드바에 Gemini API 키를 먼저 넣어주세요.")
                                 else:
                                     with st.spinner("AI가 내부자 거래를 요약 중..."):
                                         st.session_state[insum_key] = summarize_insider(clean_name(r["name"]), trades)
+                                        st.rerun()
                             if insum_key in st.session_state:
-                                st.success(st.session_state[insum_key])
+                                ai_text_box(st.session_state[insum_key], tone="purple")
 
                             with st.expander(f"내부자 거래 전체 보기 ({len(trades)}건)"):
                                 rows_html = ""
@@ -398,13 +637,134 @@ elif page == "부자들은 요즘 뭘 샀나":
         "</div>",
         unsafe_allow_html=True)
 
+    # ── 스마트머니 인기종목 랭킹 (여러 큰손이 공통으로 담은 종목) ──
+    with st.expander("🏆 스마트머니 인기종목 — 여러 큰손이 공통으로 담은 종목"):
+        st.caption(f"등록된 유명 투자자 {len(SUPER_INVESTORS)}명의 최신 13F 상위 보유 종목을 모아, "
+                   "여러 명이 겹쳐서 담은 종목을 순위로 보여줘요. (보유 투자자 수 기준)")
+        if st.button("랭킹 계산하기", key="smr_btn"):
+            with st.spinner(f"{len(SUPER_INVESTORS)}명의 13F를 SEC에서 모아 집계 중… (처음엔 좀 걸려요)"):
+                st.session_state["smr"] = compute_smart_money_ranking()
+
+        smr = st.session_state.get("smr")
+        if smr is not None:
+            shared = [x for x in smr if x["count"] >= 2][:20]
+            if not shared:
+                st.info("2명 이상이 공통으로 담은 종목을 찾지 못했어요. (데이터를 못 불러왔을 수 있어요)")
+            else:
+                max_cnt = shared[0]["count"]
+                my_tickers = set(st.session_state.get("my_tickers", []))
+                for rank, x in enumerate(shared, 1):
+                    tk = x["ticker"]
+                    tk_disp = f" <span style='color:#8a90bf;font-size:12px'>({tk})</span>" if tk else ""
+                    mine = tk and tk in my_tickers
+                    mine_disp = " <span style='color:#5DCAA5;font-size:11px'>· 내 보유</span>" if mine else ""
+                    holders = [n.split(" (")[0] for n in x["holders"]]
+                    hd = ", ".join(holders[:4]) + (f" 외 {len(holders)-4}명" if len(holders) > 4 else "")
+                    val_disp = f"${x['total_value']/1e9:,.1f}B" if x["total_value"] >= 1e9 else f"${x['total_value']/1e6:,.0f}M"
+                    bar_w = int(x["count"] / max_cnt * 100) if max_cnt else 0
+                    st.markdown(
+                        f"<div style='padding:8px 2px;border-bottom:1px solid rgba(175,169,236,0.08)'>"
+                        f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
+                        f"<span style='color:#E5E2FF;font-size:14px;font-weight:500'>{rank}. {x['name'].title()}{tk_disp}{mine_disp}</span>"
+                        f"<span style='color:#AFA9EC;font-size:13px;font-weight:600;white-space:nowrap'>{x['count']}명 · {val_disp}</span></div>"
+                        f"<div style='background:rgba(255,255,255,0.06);border-radius:4px;height:6px;margin:5px 0 4px'>"
+                        f"<div style='width:{bar_w}%;height:100%;background:#7F77DD;border-radius:4px'></div></div>"
+                        f"<div style='color:#8a90bf;font-size:11px'>{hd}</div></div>",
+                        unsafe_allow_html=True)
+                st.caption("여러 큰손이 겹쳐 담을수록 위에 표시돼요. 13F는 분기 후 약 45일 뒤 공시라 실시간이 아니며, 투자 추천이 아닙니다.")
+
+    # ── 두 투자자 포트폴리오 비교 ──────────────────────────
+    with st.expander("🆚 두 투자자 포트폴리오 비교"):
+        names_list = list(SUPER_INVESTORS.keys())
+        cc1, cc2 = st.columns(2)
+        inv_a = cc1.selectbox("투자자 A", names_list, key="cmp_inv_a")
+        inv_b = cc2.selectbox("투자자 B", names_list,
+                              index=1 if len(names_list) > 1 else 0, key="cmp_inv_b")
+        if st.button("두 투자자 비교하기", key="cmp_inv_btn"):
+            if inv_a == inv_b:
+                st.warning("서로 다른 투자자를 골라주세요.")
+            else:
+                with st.spinner("두 투자자의 13F를 불러오는 중…"):
+                    rda, ha = get_13f_holdings(SUPER_INVESTORS[inv_a], 15)
+                    rdb, hb = get_13f_holdings(SUPER_INVESTORS[inv_b], 15)
+                st.session_state["cmp_inv"] = {"a": (inv_a, rda, ha), "b": (inv_b, rdb, hb)}
+
+        ci = st.session_state.get("cmp_inv")
+        if ci:
+            (na, rda, ha), (nb, rdb, hb) = ci["a"], ci["b"]
+            if not ha or not hb:
+                st.info("두 투자자 중 한 명의 보유 종목을 불러오지 못했어요.")
+            else:
+                # 티커로 매핑 (공통 종목 찾기용)
+                def _tkmap(hs):
+                    d = {}
+                    for h in hs:
+                        k = guess_ticker(h["name"]) or h["name"].upper()
+                        d[k] = h
+                    return d
+                ma, mb = _tkmap(ha), _tkmap(hb)
+                common = set(ma) & set(mb)
+
+                if common:
+                    names = []
+                    for k in common:
+                        tkd = f" ({k})" if not k.isupper() or len(k) <= 5 else ""
+                        names.append(f"{ma[k]['name'].title()}{tkd}")
+                    st.markdown(
+                        f"<div style='background:rgba(159,225,203,0.10);border-left:3px solid #5DCAA5;"
+                        f"border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:10px;color:#E5E2FF;font-size:13px'>"
+                        f"<span style='color:#9FE1CB;font-weight:600'>두 사람 모두 보유</span> &nbsp;"
+                        f"{', '.join(names[:8])}{(' 외 ' + str(len(common)-8) + '종목') if len(common) > 8 else ''}</div>",
+                        unsafe_allow_html=True)
+                else:
+                    st.caption("상위 보유 종목 중 겹치는 종목은 없어요.")
+
+                colx, coly = st.columns(2)
+                for col, (nm_, hs) in [(colx, (na, ha)), (coly, (nb, hb))]:
+                    tot = sum(h["value"] for h in hs) or 1
+                    with col:
+                        st.markdown(
+                            f"<div style='font-weight:700;color:#F4F5FF;font-size:14px;margin-bottom:6px'>"
+                            f"{nm_.split(' (')[0]}</div>", unsafe_allow_html=True)
+                        for h in hs[:12]:
+                            k = guess_ticker(h["name"]) or h["name"].upper()
+                            shared = k in common
+                            mark = "🔗 " if shared else ""
+                            col_txt = "#9FE1CB" if shared else "#C5C9E8"
+                            w = h["value"] / tot * 100
+                            st.markdown(
+                                f"<div style='display:flex;justify-content:space-between;font-size:12px;"
+                                f"padding:3px 0;border-bottom:1px solid rgba(175,169,236,0.06)'>"
+                                f"<span style='color:{col_txt};white-space:nowrap;overflow:hidden;"
+                                f"text-overflow:ellipsis;max-width:70%'>{mark}{h['name'].title()}</span>"
+                                f"<span style='color:#8a90bf'>{w:.1f}%</span></div>",
+                                unsafe_allow_html=True)
+                st.caption("🔗 표시는 두 사람이 공통으로 담은 종목이에요. 상위 12개씩, 비중은 신고 자산 대비예요.")
+
     inv_name = st.selectbox("투자자 / 기관 선택", list(SUPER_INVESTORS.keys()))
     if st.button("보유 종목 보기", type="primary"):
         cik = SUPER_INVESTORS[inv_name]
+        import yfinance as yf
         with st.spinner(f"SEC에서 {inv_name}의 13F를 불러오는 중..."):
             report_date, holdings = get_13f_holdings(cik)
+        # 시총·티커를 여기서 한 번만 계산해서 저장 (이후 클릭마다 재계산 안 함)
+        if holdings:
+            total_val = sum(h["value"] for h in holdings)
+            with st.spinner("종목별 시가총액·티커 확인 중... (잠시만요)"):
+                for h in holdings:
+                    h["_ticker"] = guess_ticker(h["name"])
+                    h["_weight"] = h["value"] / total_val * 100 if total_val else 0
+                    h["_mcap"] = None
+                    h["_price"] = None
+                    if h["_ticker"]:
+                        try:
+                            info = yf.Ticker(h["_ticker"]).info
+                            h["_mcap"] = info.get("marketCap")
+                            h["_price"] = info.get("currentPrice") or info.get("regularMarketPrice")
+                        except Exception:
+                            pass
         st.session_state["si_result"] = (inv_name, report_date, holdings)
-        for k in ("si_ai", "si_small_ai", "si_show_all", "si_page", "si_open_stock", "si_stock_ai"):
+        for k in ("si_ai", "si_small_ai", "si_show_all", "si_page", "si_open_stock", "si_stock_ai", "cmp13f"):
             st.session_state.pop(k, None)
 
     if "si_result" in st.session_state:
@@ -435,36 +795,141 @@ elif page == "부자들은 요즘 뭘 샀나":
                 f"<div style='color:#8a90bf;font-size:13px;margin-bottom:14px'>보유 종목 {len(holdings)}개 · 신고 자산 총액 약 ${total_val/1e9:,.1f}B</div>",
                 unsafe_allow_html=True)
 
-            # 시총 조회 (작은 회사 집중 매수 판단)
+            # ── 직전 분기 대비 변화 (신규매수·전량매도·비중확대·축소) ──
+            with st.expander("📊 직전 분기 대비 무엇이 바뀌었나 (신규 매수·전량 매도)"):
+                st.caption("이전 분기 13F 보고서와 비교해 새로 사고 판 종목을 정리해요. (보유 주식 수 기준)")
+                if st.button("변화 분석하기", key="cmp13f_btn"):
+                    cik = SUPER_INVESTORS.get(nm)
+                    if not cik:
+                        st.session_state["cmp13f"] = {"ok": False, "reason": "이 투자자의 CIK를 찾지 못했어요."}
+                    else:
+                        with st.spinner("이전 분기 보고서를 SEC에서 가져와 비교 중…"):
+                            st.session_state["cmp13f"] = get_13f_comparison(cik)
+
+                cmp = st.session_state.get("cmp13f")
+                if cmp:
+                    if not cmp.get("ok"):
+                        st.info(cmp.get("reason", "비교 데이터를 가져오지 못했어요."))
+                    else:
+                        st.markdown(
+                            f"<div style='color:#9BA0C4;font-size:13px;margin:4px 0 10px'>"
+                            f"<span style='color:#AFA9EC'>{cmp['prev_date']}</span> → "
+                            f"<span style='color:#AFA9EC'>{cmp['latest_date']}</span> 비교 · 보유 주식 수 기준</div>",
+                            unsafe_allow_html=True)
+
+                        def _cmp_block(title, items, color, emoji, show_chg=False):
+                            if not items:
+                                return
+                            st.markdown(
+                                f"<div style='font-weight:600;color:{color};margin:10px 0 4px'>{emoji} {title} "
+                                f"<span style='color:#8a90bf;font-weight:400'>({len(items)}종목)</span></div>",
+                                unsafe_allow_html=True)
+                            for it in items[:10]:
+                                tk = guess_ticker(it["name"]) or ""
+                                tk_disp = f" <span style='color:#8a90bf'>({tk})</span>" if tk else ""
+                                val_disp = f"${it['value']/1e6:,.0f}M" if it.get("value") else ""
+                                chg_disp = ""
+                                if show_chg and it.get("change_pct") is not None:
+                                    sign = "+" if it["change_pct"] > 0 else ""
+                                    chg_disp = f" · 주식 수 {sign}{it['change_pct']}%"
+                                st.markdown(
+                                    f"<div style='display:flex;justify-content:space-between;"
+                                    f"border-bottom:1px solid rgba(175,169,236,0.08);padding:5px 2px;font-size:13px'>"
+                                    f"<span style='color:#E5E2FF'>{it['name'].title()}{tk_disp}</span>"
+                                    f"<span style='color:#9BA0C4'>{val_disp}{chg_disp}</span></div>",
+                                    unsafe_allow_html=True)
+                            if len(items) > 10:
+                                st.caption(f"…외 {len(items)-10}종목")
+
+                        any_change = any([cmp["new"], cmp["exited"], cmp["increased"], cmp["decreased"]])
+                        if not any_change:
+                            st.info("직전 분기와 비교해 눈에 띄는 변화가 없어요.")
+                        else:
+                            _cmp_block("새로 산 종목 (신규 매수)", cmp["new"], "#5DCAA5", "🟢")
+                            _cmp_block("전부 판 종목 (전량 매도)", cmp["exited"], "#E8896B", "🔴")
+                            _cmp_block("비중 늘린 종목", cmp["increased"], "#9FE1CB", "▲", show_chg=True)
+                            _cmp_block("비중 줄인 종목", cmp["decreased"], "#F0B27B", "▼", show_chg=True)
+                        st.caption("13F는 분기 종료 후 최대 45일 뒤 공시되어, 현재 보유와 다를 수 있어요.")
+
+            # 시총은 이미 저장됨. 겹침/소형주 판단만 (네트워크 호출 없음)
             import yfinance as yf
             from superinvestor_fetch import classify_size
             my_tickers = set(st.session_state.get("my_tickers", []))
             overlaps = []
             small_bets = []
-            with st.spinner("종목별 시가총액 확인 중..."):
-                for h in holdings:
-                    h["_ticker"] = guess_ticker(h["name"])
-                    h["_weight"] = h["value"] / total_val * 100
-                    h["_mcap"] = None
-                    if h["_ticker"]:
-                        try:
-                            h["_mcap"] = yf.Ticker(h["_ticker"]).info.get("marketCap")
-                        except Exception:
-                            pass
-                    if h["_mcap"] and h["_mcap"] < 10e9 and h["_weight"] >= 5:
-                        small_bets.append(h)
+            for h in holdings:
+                if h.get("_mcap") and h["_mcap"] < 10e9 and h.get("_weight", 0) >= 5:
+                    small_bets.append(h)
 
             # 내 종목 겹침
             if my_tickers:
+                overlap_holdings = []
                 for h in holdings:
                     if h["_ticker"] and h["_ticker"] in my_tickers:
                         overlaps.append((h["name"], h["_ticker"]))
+                        overlap_holdings.append(h)
                 if overlaps:
                     ov = ", ".join(f"{n} ({t})" for n, t in overlaps)
                     st.markdown(
-                        f"<div style='background:rgba(159,225,203,0.10);border-left:3px solid #5DCAA5;border-radius:0 8px 8px 0;padding:12px 16px;margin-bottom:12px;color:#E5E2FF;font-size:14px'>"
-                        f"<span style='color:#9FE1CB;font-weight:500'>나와 겹치는 종목</span> &nbsp;{ov}</div>",
+                        f"<div style='background:rgba(159,225,203,0.10);border-left:3px solid #5DCAA5;border-radius:0 8px 8px 0;padding:12px 16px;margin-bottom:6px;color:#E5E2FF;font-size:14px'>"
+                        f"<span style='color:#9FE1CB;font-weight:600'>나와 겹치는 종목</span> &nbsp;{ov}</div>",
                         unsafe_allow_html=True)
+                    # 겹치는 종목별 상세 (이 투자자의 비중 + 내 수익률)
+                    my_returns = {}
+                    for rr in st.session_state.get("results", []):
+                        if "error" not in rr and rr.get("user_return_pct") is not None:
+                            my_returns[rr["ticker"]] = rr["user_return_pct"]
+                    cards = ""
+                    for h in overlap_holdings:
+                        tk = h["_ticker"]
+                        their_w = h["_weight"]
+                        my_r = my_returns.get(tk)
+                        kr = ""
+                        try:
+                            from stock_search import korean_name
+                            kr = korean_name(tk) or ""
+                        except Exception:
+                            pass
+                        name_disp = f"{kr} ({tk})" if kr else f"{h['name']} ({tk})"
+                        my_part = ""
+                        if my_r is not None:
+                            rc = "#9FE1CB" if my_r > 0 else "#F0997B" if my_r < 0 else "#AFA9EC"
+                            my_part = f"<span style='color:{rc}'>내 수익률 {my_r:+.1f}%</span>"
+                        cards += (
+                            f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                            f"background:rgba(159,225,203,0.05);border-radius:8px;padding:9px 14px;margin:4px 0;font-size:13px'>"
+                            f"<span style='color:#E5E2FF;font-weight:500'>{name_disp}</span>"
+                            f"<span style='color:#C5C9E8'>이 투자자 비중 {their_w:.1f}% &nbsp;·&nbsp; {my_part}</span></div>"
+                        )
+                    st.markdown(f"<div style='margin-bottom:14px'>{cards}</div>", unsafe_allow_html=True)
+
+            # 이 투자자가 보유한 소형주/중형주 정리 (규모별 발굴 종목)
+            small_caps = []
+            mid_caps = []
+            for h in holdings:
+                if h.get("_mcap"):
+                    if h["_mcap"] < 2e9:
+                        small_caps.append(h)
+                    elif h["_mcap"] < 10e9:
+                        mid_caps.append(h)
+            if small_caps or mid_caps:
+                def _cap_rows(lst, emoji, label, color):
+                    if not lst:
+                        return ""
+                    lst_sorted = sorted(lst, key=lambda x: x["_weight"], reverse=True)
+                    rows = ""
+                    for h in lst_sorted[:8]:
+                        rows += (f"<div style='display:flex;justify-content:space-between;padding:5px 0;font-size:13px'>"
+                                 f"<span style='color:#E5E2FF'>{h['name']}</span>"
+                                 f"<span style='color:#8a90bf'>비중 {h['_weight']:.1f}% · 시총 ${h['_mcap']/1e9:.1f}B</span></div>")
+                    more = f"<div style='color:#8a90bf;font-size:12px;margin-top:4px'>외 {len(lst)-8}개 더</div>" if len(lst) > 8 else ""
+                    return (f"<div style='margin-bottom:8px'><div style='color:{color};font-weight:600;font-size:13px;margin-bottom:2px'>{emoji} {label} ({len(lst)}개)</div>{rows}{more}</div>")
+                body = _cap_rows(small_caps, "🔴", "소형주 (시총 20억 달러 미만)", "#F0997B") + _cap_rows(mid_caps, "🟠", "중형주 (시총 100억 달러 미만)", "#EF9F27")
+                st.markdown(
+                    f"<div style='background:rgba(127,119,221,0.06);border:0.5px solid rgba(175,169,236,0.2);border-radius:10px;padding:12px 16px;margin-bottom:14px'>"
+                    f"<div style='color:#C5C9E8;font-size:12px;margin-bottom:8px'>이 투자자가 보유한 중소형주예요. 대형주보다 변동성이 크지만 발굴형 베팅일 수 있어요.</div>"
+                    f"{body}</div>",
+                    unsafe_allow_html=True)
 
             # 작은 회사 집중 매수
             if small_bets:
@@ -506,10 +971,7 @@ elif page == "부자들은 요즘 뭘 샀나":
                             except Exception as e:
                                 st.session_state["si_small_ai"] = _friendly_error(e)
                     if "si_small_ai" in st.session_state:
-                        txt = st.session_state["si_small_ai"].replace("#", "").replace("**", "").replace("\n", "<br>")
-                        st.markdown(
-                            f"<div style='background:rgba(240,153,123,0.08);border:0.5px solid rgba(240,153,123,0.25);border-radius:10px;padding:14px 16px;margin-bottom:10px;color:#E5E2FF;font-size:14px;line-height:1.8'>{txt}</div>",
-                            unsafe_allow_html=True)
+                        ai_text_box(st.session_state["si_small_ai"], tone="orange")
 
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -535,10 +997,7 @@ elif page == "부자들은 요즘 뭘 샀나":
                         except Exception as e:
                             st.session_state["si_ai"] = _friendly_error(e)
                 if "si_ai" in st.session_state:
-                    txt = st.session_state["si_ai"].replace("#", "").replace("**", "").replace("\n", "<br>")
-                    st.markdown(
-                        f"<div style='background:rgba(127,119,221,0.10);border:0.5px solid rgba(175,169,236,0.25);border-radius:10px;padding:14px 16px;margin-bottom:10px;color:#E5E2FF;font-size:14px;line-height:1.8'>{txt}</div>",
-                        unsafe_allow_html=True)
+                    ai_text_box(st.session_state["si_ai"], tone="purple")
 
             # 보유 종목 목록 (15개씩 페이지 넘기기 + 종목 클릭 상세)
             st.markdown("<div style='color:#9BA0C4;font-size:13px;margin:10px 0 4px'>종목을 누르면 뉴스·데이터·AI 매수 이유를 볼 수 있습니다.</div>", unsafe_allow_html=True)
@@ -556,12 +1015,18 @@ elif page == "부자들은 요즘 뭘 샀나":
                     tags += " · 보유"
                 if h.get("_mcap") and h["_mcap"] < 10e9:
                     size, _ = classify_size(h["_mcap"])
-                    tags += f" · {size}"
-                label = f"{i}. {h['name']}{tags}    ${h['value']/1e6:,.0f}M ({h['_weight']:.1f}%)"
+                    emoji = "🔴" if size == "소형주" else "🟠"
+                    tags += f" · {emoji} {size}"
+                # 뉴스 요약을 본 종목은 체크 표시
+                tkk = h.get("_ticker")
+                if tkk and f"si_newsum_{tkk}" in st.session_state:
+                    tags += " · ✅뉴스"
+                # 현재가는 펼침 상세에만 표시 (목록 줄에는 제외)
+                # 달러기호($)는 \$로 이스케이프 — 안 하면 Streamlit이 $…$ 사이를 수식으로 잘못 렌더링함
+                label = f"{i}. {h['name']}{tags}    \\${h['value']/1e6:,.0f}M ({h['_weight']:.1f}%)"
                 if st.button(label, key=f"stk_{start}_{i}", use_container_width=True):
                     cur = st.session_state.get("si_open_stock")
                     st.session_state["si_open_stock"] = None if cur == h["name"] else h["name"]
-                    st.session_state.pop("si_stock_ai", None)
                     st.rerun()
 
                 # 종목 상세 펼침
@@ -571,9 +1036,15 @@ elif page == "부자들은 요즘 뭘 샀나":
                         if not tk:
                             st.caption("이 종목은 티커 매칭에 실패해서 상세 정보를 불러올 수 없어요.")
                         else:
-                            # 데이터 분석 (점수)
-                            try:
-                                sd = score_stock(tk, None)
+                            # 데이터 분석 (점수) - 종목별 캐싱
+                            sd_key = f"si_data_{tk}"
+                            if sd_key not in st.session_state:
+                                try:
+                                    st.session_state[sd_key] = score_stock(tk, None)
+                                except Exception:
+                                    st.session_state[sd_key] = None
+                            sd = st.session_state[sd_key]
+                            if sd:
                                 dline = ""
                                 if not sd.get("is_etf"):
                                     if sd.get("per"): dline += f"PER {sd['per']:.1f} · "
@@ -585,12 +1056,25 @@ elif page == "부자들은 요즘 뭘 샀나":
                                     f"<div style='background:rgba(127,119,221,0.08);border-radius:8px;padding:10px 14px;margin:4px 0;color:#C5C9E8;font-size:13px'>"
                                     f"<b style='color:#AFA9EC'>{sd.get('name', tk)}</b> ({tk})<br>{dline.rstrip(' · ')}</div>",
                                     unsafe_allow_html=True)
-                            except Exception:
+                            else:
                                 st.caption("데이터를 불러오지 못했어요.")
 
-                            # 뉴스 (펼쳐보기)
-                            news_items = get_news(tk, limit=8)
+                            # 뉴스 - 종목별 캐싱
+                            news_key = f"si_news_{tk}"
+                            if news_key not in st.session_state:
+                                st.session_state[news_key] = get_news(tk, limit=8)
+                            news_items = st.session_state[news_key]
                             if news_items:
+                                # 뉴스 요약 (체크 연동)
+                                if api_key:
+                                    newsum_key = f"si_newsum_{tk}"
+                                    nsum_label = "뉴스 요약 다시 보기" if newsum_key in st.session_state else "뉴스 핵심 요약"
+                                    if st.button(nsum_label, key=f"nsum_{start}_{i}"):
+                                        with st.spinner("AI가 뉴스를 요약 중..."):
+                                            st.session_state[newsum_key] = summarize_news(h["name"], news_items, tk)
+                                            st.rerun()
+                                    if newsum_key in st.session_state:
+                                        ai_text_box(st.session_state[newsum_key], tone="purple")
                                 with st.expander(f"최신 뉴스 ({len(news_items)}건)"):
                                     for n in news_items:
                                         meta = " · ".join(x for x in [n.get("publisher", ""), n.get("time", "")] if x)
@@ -599,9 +1083,11 @@ elif page == "부자들은 요즘 뭘 샀나":
                                         else:
                                             st.markdown(f"- {n['title']}  \n<span style='color:#8a90bf;font-size:12px'>{meta}</span>", unsafe_allow_html=True)
 
-                            # AI 매수 이유
+                            # AI 매수 이유 - 종목별 키로 보존
                             if api_key:
-                                if st.button("이 종목을 왜 샀는지 AI 분석", key=f"why_{start}_{i}"):
+                                why_key = f"si_why_{tk}"
+                                why_label = "AI 분석 다시 보기" if why_key in st.session_state else "이 종목을 왜 샀는지 AI 분석"
+                                if st.button(why_label, key=f"why_{start}_{i}"):
                                     from ai_explain import _client, _friendly_error
                                     heads = "; ".join(n["title"] for n in news_items[:4]) if news_items else ""
                                     with st.spinner("AI가 분석 중..."):
@@ -612,14 +1098,12 @@ elif page == "부자들은 요즘 뭘 샀나":
                                                       "뉴스 맥락을 참고해 추측해서 한국어로 3~4문장으로 쉽게 설명해줘. "
                                                       "제목·번호·별표 없이 자연스러운 문단으로. 투자 추천은 하지 마.")
                                             resp = _client.models.generate_content(model="gemini-2.5-flash-lite", contents=prompt)
-                                            st.session_state["si_stock_ai"] = resp.text.strip()
+                                            st.session_state[why_key] = resp.text.strip()
                                         except Exception as e:
-                                            st.session_state["si_stock_ai"] = _friendly_error(e)
-                                if "si_stock_ai" in st.session_state:
-                                    txt = st.session_state["si_stock_ai"].replace("#", "").replace("**", "").replace("\n", "<br>")
-                                    st.markdown(
-                                        f"<div style='background:rgba(127,119,221,0.10);border:0.5px solid rgba(175,169,236,0.25);border-radius:10px;padding:12px 14px;margin:6px 0;color:#E5E2FF;font-size:14px;line-height:1.8'>{txt}</div>",
-                                        unsafe_allow_html=True)
+                                            st.session_state[why_key] = _friendly_error(e)
+                                        st.rerun()
+                                if why_key in st.session_state:
+                                    ai_text_box(st.session_state[why_key], tone="purple")
 
             # 페이지 넘기기
             if n_pages > 1:
@@ -654,6 +1138,107 @@ elif page == "종목 검색":
                               label_visibility="collapsed")
     with c2:
         do_search = st.button("검색", type="primary", use_container_width=True)
+
+    # ── 여러 종목 비교 (2~3개 나란히) ──────────────────────
+    with st.expander("🆚 여러 종목 한눈에 비교하기 (2~3개)"):
+        cmp_q = st.text_input("비교할 종목들",
+                              placeholder="쉼표로 구분, 예: AAPL, MSFT, NVDA",
+                              key="sf_cmp_input", label_visibility="collapsed")
+        if st.button("비교하기", key="sf_cmp_btn"):
+            raw_tokens = [x.strip() for x in cmp_q.replace("，", ",").split(",") if x.strip()]
+            cmp_list = []
+            seen_tk = set()
+            with st.spinner("종목들을 찾아 점수를 매기는 중…"):
+                for tok in raw_tokens[:3]:   # 최대 3개
+                    tkc, _nm = search_ticker(tok)
+                    if not tkc or tkc in seen_tk:
+                        if not tkc:
+                            cmp_list.append({"query": tok, "error": True})
+                        continue
+                    seen_tk.add(tkc)
+                    try:
+                        rr = score_stock(tkc, None)
+                    except Exception:
+                        rr = None
+                    if rr:
+                        cmp_list.append({"query": tok, "error": False, "tk": tkc, "r": rr})
+                    else:
+                        cmp_list.append({"query": tok, "error": True})
+            st.session_state["sf_cmp_results"] = cmp_list
+
+        cmp_results = st.session_state.get("sf_cmp_results")
+        if cmp_results:
+            valid = [c for c in cmp_results if not c["error"]]
+            bad = [c for c in cmp_results if c["error"]]
+            if bad:
+                st.caption("찾지 못한 입력: " + ", ".join(c["query"] for c in bad))
+            if len(valid) < 2:
+                st.info("비교하려면 유효한 종목이 2개 이상 필요해요.")
+            else:
+                def _score_color(v):
+                    try:
+                        v = float(v)
+                    except Exception:
+                        return "#7F77DD"
+                    return "#5DCAA5" if v >= 70 else ("#7F77DD" if v >= 50 else "#F0997B")
+
+                def _bar(label, v):
+                    try:
+                        w = max(0, min(100, float(v)))
+                        vtxt = f"{int(round(float(v)))}"
+                    except Exception:
+                        w, vtxt = 0, "—"
+                    col = _score_color(v)
+                    return (
+                        "<div style='margin:7px 0'>"
+                        "<div style='display:flex;justify-content:space-between;font-size:12px;color:#9BA0C4;margin-bottom:3px'>"
+                        f"<span>{label}</span><span style='color:#F4F5FF;font-weight:700'>{vtxt}</span></div>"
+                        "<div style='background:rgba(255,255,255,0.07);border-radius:5px;height:9px'>"
+                        f"<div style='width:{w}%;height:100%;background:{col};border-radius:5px'></div></div></div>")
+
+                # 상단: 종목별 점수 막대 게이지
+                cols = st.columns(len(valid))
+                for col, c in zip(cols, valid):
+                    r = c["r"]; tkc = c["tk"]
+                    nm = clean_name(r.get("name", tkc))
+                    total = round(((r.get("profit_score") or 0) + (r.get("stability_score") or 0)) / 2)
+                    with col:
+                        st.markdown(
+                            f"<div style='font-weight:700;color:#F4F5FF;font-size:19px'>{tkc}</div>"
+                            f"<div style='color:#8a90bf;font-size:12px;margin-bottom:10px;"
+                            f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{nm}</div>"
+                            + _bar("종합", total)
+                            + _bar("수익성", r.get("profit_score", "—"))
+                            + _bar("안정성", r.get("stability_score", "—")),
+                            unsafe_allow_html=True)
+
+                # 하단: 지표 비교표 (전체 폭). $ 충돌을 피하려고 현재가는 헤더에 단위 표기
+                metrics = [
+                    ("PER", lambda r: f"{r['per']}" if r.get("per") is not None else "—"),
+                    ("현재가 ($)", lambda r: f"{r['current_price']:,}" if r.get("current_price") is not None else "—"),
+                    ("상승여력", lambda r: f"{r['upside_pct']}%" if r.get("upside_pct") is not None else "—"),
+                    ("변동성", lambda r: f"{r['volatility']}" if r.get("volatility") is not None else "—"),
+                    ("부채비율", lambda r: f"{r['debt_to_equity']}%" if r.get("debt_to_equity") is not None else "—"),
+                    ("투자의견", lambda r: r.get("analyst_rec") or "—"),
+                ]
+                th = ("<th style='text-align:left;padding:8px 10px;color:#9BA0C4;font-weight:500;"
+                      "border-bottom:1px solid rgba(175,169,236,0.2)'>지표</th>")
+                for c in valid:
+                    th += (f"<th style='text-align:right;padding:8px 10px;color:#F4F5FF;"
+                           f"border-bottom:1px solid rgba(175,169,236,0.2)'>{c['tk']}</th>")
+                rows_html = ""
+                for mlabel, fn in metrics:
+                    cells = (f"<td style='padding:7px 10px;color:#9BA0C4;"
+                             f"border-bottom:1px solid rgba(175,169,236,0.06)'>{mlabel}</td>")
+                    for c in valid:
+                        cells += (f"<td style='padding:7px 10px;text-align:right;color:#E5E2FF;"
+                                  f"border-bottom:1px solid rgba(175,169,236,0.06)'>{fn(c['r'])}</td>")
+                    rows_html += f"<tr>{cells}</tr>"
+                st.markdown(
+                    f"<table style='width:100%;border-collapse:collapse;margin-top:16px;font-size:13px'>"
+                    f"<tr>{th}</tr>{rows_html}</table>",
+                    unsafe_allow_html=True)
+                st.caption("막대는 0~100점 기준이에요. 점수는 이 앱 기준이며 투자 추천이 아닙니다.")
 
     if do_search and query.strip():
         with st.spinner("종목을 찾는 중..."):
@@ -733,10 +1318,7 @@ elif page == "종목 검색":
                 with st.spinner("AI가 설명을 작성 중..."):
                     st.session_state["sf_ai"] = explain_stock(r)
             if "sf_ai" in st.session_state:
-                txt = st.session_state["sf_ai"].replace("#", "").replace("**", "").replace("\n", "<br>")
-                st.markdown(
-                    f"<div style='background:rgba(127,119,221,0.10);border:0.5px solid rgba(175,169,236,0.25);border-radius:10px;padding:14px 16px;margin:6px 0;color:#E5E2FF;font-size:14px;line-height:1.8'>{txt}</div>",
-                    unsafe_allow_html=True)
+                ai_text_box(st.session_state["sf_ai"], tone="purple")
         else:
             st.caption("AI 설명을 보려면 왼쪽 사이드바에 Gemini API 키를 넣어주세요.")
 
@@ -747,12 +1329,9 @@ elif page == "종목 검색":
             if api_key:
                 if st.button("뉴스 핵심 요약"):
                     with st.spinner("AI가 뉴스를 요약 중..."):
-                        st.session_state["sf_news_ai"] = summarize_news(name, news_items)
+                        st.session_state["sf_news_ai"] = summarize_news(name, news_items, tk)
                 if "sf_news_ai" in st.session_state:
-                    txt = st.session_state["sf_news_ai"].replace("#", "").replace("**", "").replace("\n", "<br>")
-                    st.markdown(
-                        f"<div style='background:rgba(127,119,221,0.08);border:0.5px solid rgba(175,169,236,0.22);border-radius:10px;padding:12px 14px;margin:6px 0;color:#E5E2FF;font-size:14px;line-height:1.8'>{txt}</div>",
-                        unsafe_allow_html=True)
+                    ai_text_box(st.session_state["sf_news_ai"], tone="purple")
             with st.expander(f"뉴스 전체 보기 ({len(news_items)}건)"):
                 for n in news_items:
                     meta = " · ".join(x for x in [n.get("publisher", ""), n.get("time", "")] if x)
@@ -777,10 +1356,7 @@ elif page == "종목 검색":
                             with st.spinner("AI가 요약 중..."):
                                 st.session_state["sf_insider_ai"] = summarize_insider(name, trades)
                         if "sf_insider_ai" in st.session_state:
-                            txt = st.session_state["sf_insider_ai"].replace("#", "").replace("**", "").replace("\n", "<br>")
-                            st.markdown(
-                                f"<div style='background:rgba(127,119,221,0.08);border:0.5px solid rgba(175,169,236,0.22);border-radius:10px;padding:12px 14px;margin:6px 0;color:#E5E2FF;font-size:14px;line-height:1.8'>{txt}</div>",
-                                unsafe_allow_html=True)
+                            ai_text_box(st.session_state["sf_insider_ai"], tone="purple")
                     with st.expander(f"내부자 거래 전체 보기 ({len(trades)}건)"):
                         for t in trades:
                             head = f"**{t['name']}**" + (f" · {t['title']}" if t.get("title") else "") + f"  \n<span style='color:#8a90bf;font-size:12px'>{t['date']}</span>"
@@ -793,6 +1369,141 @@ elif page == "종목 검색":
                                 st.markdown(f"<span style='color:{color};font-size:13px'>　{detail}</span>", unsafe_allow_html=True)
 
         st.caption("무료 데이터 기반이며, 정보 제공용입니다. 투자 판단의 책임은 본인에게 있습니다.")
+
+
+elif page == "미국 정부·정책 분석":
+    st.markdown(
+        "<div style='border-bottom:1px solid rgba(175,169,236,0.2);padding-bottom:14px;margin-bottom:18px'>"
+        "<div style='font-size:28px;font-weight:700;font-family:Orbitron,sans-serif;color:#F4F5FF;letter-spacing:0.5px;text-shadow:0 0 18px rgba(127,119,221,0.5)'>POLICY RADAR</div>"
+        "<div style='color:#9BA0C4;font-size:14px;margin-top:4px'>현 미국 정부·대통령의 최근 정책 동향을 웹에서 찾아, 영향받을 수 있는 산업·종목을 AI가 분석합니다.</div>"
+        "</div>",
+        unsafe_allow_html=True)
+
+    # 정치적 중립 + 면책 안내
+    st.markdown(
+        "<div style='background:rgba(240,153,123,0.08);border:0.5px solid rgba(240,153,123,0.3);"
+        "border-radius:10px;padding:12px 16px;margin-bottom:14px;color:#E5D5CC;font-size:13px;line-height:1.7'>"
+        "이 페이지는 <b>정치적으로 중립</b>이며 특정 정당·정치인을 지지·비판하지 않습니다. "
+        "AI가 웹 검색으로 모은 정보를 정리한 <b>교육용 분석</b>일 뿐, 매수·매도 추천이 아닙니다. "
+        "정책과 주가의 관계는 불확실하며, 정책은 언제든 바뀔 수 있습니다."
+        "</div>",
+        unsafe_allow_html=True)
+
+    if not api_key:
+        st.warning("이 기능은 AI 검색을 사용해요. 왼쪽 사이드바에 Gemini API 키를 먼저 넣어주세요.")
+    else:
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            focus = st.text_input(
+                "관심 분야",
+                placeholder="예: 반도체, AI 인프라, 관세, 에너지, 방산 … (비워두면 전반적 동향)",
+                label_visibility="collapsed")
+        with c2:
+            do_policy = st.button("분석하기", type="primary", use_container_width=True)
+        st.caption("AI가 직접 웹을 검색하므로 답변까지 10~30초쯤 걸릴 수 있어요. 검색 결과에 따라 내용이 매번 조금씩 달라집니다.")
+
+        if do_policy:
+            with st.spinner("최근 미국 정부 정책을 웹에서 찾아 분석하는 중…"):
+                data, err = analyze_government_policy(focus)
+            if err:
+                st.error(err)
+            else:
+                st.session_state["policy_data"] = data
+                st.session_state["policy_focus"] = focus.strip()
+                st.session_state.pop("policy_pick", None)  # 이전 종목 선택 초기화
+
+        data = st.session_state.get("policy_data")
+        if data:
+            shown_focus = st.session_state.get("policy_focus")
+            if shown_focus:
+                st.markdown(
+                    f"<div style='color:#9BA0C4;font-size:13px;margin:4px 0 2px'>관심 분야: "
+                    f"<span style='color:#AFA9EC'>{shown_focus}</span></div>",
+                    unsafe_allow_html=True)
+
+            st.subheader("최근 정책 동향과 영향 분석")
+            ai_text_box(data.get("text", ""), tone="purple")
+
+            # ── 출처 ─────────────────────────────────────
+            sources = data.get("sources") or []
+            queries = data.get("queries") or []
+            if sources or queries:
+                with st.expander(f"🔎 AI가 참고한 출처 {len(sources)}개 보기"):
+                    if queries:
+                        st.markdown(
+                            "<div style='color:#9BA0C4;font-size:12px;margin-bottom:6px'>AI 검색어: "
+                            + ", ".join(f"<span style='color:#AFA9EC'>{q}</span>" for q in queries)
+                            + "</div>", unsafe_allow_html=True)
+                    for s in sources:
+                        title = s.get("title") or s.get("uri")
+                        uri = s.get("uri")
+                        st.markdown(
+                            f"<div style='font-size:13px;margin:3px 0'>• "
+                            f"<a href='{uri}' target='_blank' style='color:#9BC4FF;text-decoration:none'>{title}</a></div>",
+                            unsafe_allow_html=True)
+            else:
+                st.caption("이번 분석에서는 표시할 출처를 가져오지 못했어요. (검색이 일어나지 않았을 수 있어요)")
+
+            # ── 정책 관련 종목 후보 → 누르면 점수 보기 ─────
+            policy_ticker_section(data.get("tickers") or [], key_prefix="policy_search",
+                                  names=data.get("ticker_names") or {})
+
+        # ════════════════════════════════════════════════════
+        # 대표 분야 빠르게 보기 (칩 클릭 → 최근 4년 타임라인)
+        # ════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("또는, 대표 분야를 눌러 최근 4년 흐름 보기")
+        st.caption("미국 정부가 그 분야에서 최근 4년간 무슨 정책·발언을 했고, 어떤 영향을 줬는지 타임라인으로 정리해드려요.")
+
+        SECTORS = ["반도체", "AI 인프라", "에너지", "방산·국방",
+                   "제약·바이오", "관세·무역", "암호화폐", "전기차·배터리"]
+        sec_cols = st.columns(4)
+        for i, sec in enumerate(SECTORS):
+            if sec_cols[i % 4].button(sec, key=f"policy_sec_{i}", use_container_width=True):
+                with st.spinner(f"'{sec}' 분야의 최근 4년 정책 흐름을 웹에서 찾는 중…"):
+                    tdata, terr = analyze_sector_policy_timeline(sec)
+                if terr:
+                    st.session_state["policy_timeline_err"] = terr
+                    st.session_state.pop("policy_timeline_data", None)
+                else:
+                    st.session_state["policy_timeline_data"] = tdata
+                    st.session_state["policy_timeline_sector"] = sec
+                    st.session_state.pop("policy_timeline_err", None)
+                    st.session_state.pop("policy_tl_pick", None)
+
+        if st.session_state.get("policy_timeline_err"):
+            st.error(st.session_state["policy_timeline_err"])
+
+        tdata = st.session_state.get("policy_timeline_data")
+        if tdata:
+            sec_name = st.session_state.get("policy_timeline_sector", "")
+            st.markdown(
+                f"<div style='font-size:20px;font-weight:700;color:#F4F5FF;margin:14px 0 4px'>"
+                f"🏛️ {sec_name} · 최근 4년 정책 타임라인</div>",
+                unsafe_allow_html=True)
+            ai_text_box(tdata.get("text", ""), tone="purple")
+
+            tl_sources = tdata.get("sources") or []
+            tl_queries = tdata.get("queries") or []
+            if tl_sources or tl_queries:
+                with st.expander(f"🔎 AI가 참고한 출처 {len(tl_sources)}개 보기"):
+                    if tl_queries:
+                        st.markdown(
+                            "<div style='color:#9BA0C4;font-size:12px;margin-bottom:6px'>AI 검색어: "
+                            + ", ".join(f"<span style='color:#AFA9EC'>{q}</span>" for q in tl_queries)
+                            + "</div>", unsafe_allow_html=True)
+                    for s in tl_sources:
+                        title = s.get("title") or s.get("uri")
+                        uri = s.get("uri")
+                        st.markdown(
+                            f"<div style='font-size:13px;margin:3px 0'>• "
+                            f"<a href='{uri}' target='_blank' style='color:#9BC4FF;text-decoration:none'>{title}</a></div>",
+                            unsafe_allow_html=True)
+
+            policy_ticker_section(tdata.get("tickers") or [], key_prefix="policy_tl",
+                                  names=tdata.get("ticker_names") or {})
+
+        st.caption("AI·웹검색 기반 교육용 분석이며, 투자 판단의 책임은 본인에게 있습니다.")
 
 
 st.divider()
