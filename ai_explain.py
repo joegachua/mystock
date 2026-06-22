@@ -18,6 +18,35 @@ def _friendly_error(e):
         return "🔑 API 키에 문제가 있어요. 키를 다시 확인해주세요."
     return "AI 응답을 가져오지 못했어요. 잠시 후 다시 시도해주세요."
 
+
+def _simple_generate(prompt, models=("gemini-2.5-flash-lite", "gemini-2.5-flash")):
+    """검색 없이 텍스트를 생성한다. 일시적 오류(429/503/과부하) 시 재시도하고,
+    그래도 안 되면 다른 모델로 폴백한다. 빈 응답도 안전하게 처리.
+    반환: 생성된 문자열(또는 사용자 친화적 오류 메시지)."""
+    if _client is None:
+        return "(API 키가 설정되지 않았어요)"
+    import time
+    last_err = None
+    for model_name in models:
+        for attempt in range(2):           # 모델당 최대 2번 시도
+            try:
+                resp = _client.models.generate_content(model=model_name, contents=prompt)
+                text = (getattr(resp, "text", None) or "").strip()
+                if text:
+                    return text
+                last_err = None            # 빈 응답 → 재시도/다음 모델
+            except Exception as e:
+                last_err = e
+                es = str(e)
+                transient = (any(k in es for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"))
+                             or "overloaded" in es.lower())
+                if not transient:
+                    break                  # 일시적 오류가 아니면 같은 모델 재시도 무의미 → 다음 모델
+            time.sleep(0.8 * (attempt + 1))
+    if isinstance(last_err, Exception):
+        return _friendly_error(last_err)
+    return "AI가 빈 응답을 줬어요. 잠시 후 다시 시도해주세요. (다른 종목은 잘 될 수 있어요)"
+
 def explain_stock(result):
     """점수 계산 결과(dict)를 받아 초보자용 한 줄 설명을 생성한다."""
     if _client is None:
@@ -65,14 +94,7 @@ def explain_stock(result):
         + "\n".join(facts)
     )
 
-    try:
-        resp = _client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt,
-        )
-        return resp.text.strip()
-    except Exception as e:
-        return _friendly_error(e)
+    return _simple_generate(prompt)
 
 
 def summarize_news(name, news_items, ticker=None):
@@ -110,14 +132,7 @@ def summarize_news(name, news_items, ticker=None):
         "'최근 이 종목과 직접 관련된 구체적인 뉴스는 많지 않네요.'라고만 답해.\n\n"
         + titles
     )
-    try:
-        resp = _client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt,
-        )
-        return resp.text.strip()
-    except Exception as e:
-        return _friendly_error(e)
+    return _simple_generate(prompt)
 
 
 def _recognize_one(parts_imgs):
@@ -284,12 +299,7 @@ def diagnose_portfolio(summary):
         "제목·번호·별표 없이 자연스러운 문단으로. 전문용어는 쉽게 풀어서. "
         "특정 종목 매수/매도 추천은 절대 하지 말고, 객관적 진단만.\n"
     )
-    try:
-        resp = _client.models.generate_content(
-            model="gemini-2.5-flash-lite", contents=prompt)
-        return resp.text.strip()
-    except Exception as e:
-        return _friendly_error(e)
+    return _simple_generate(prompt)
 
 
 def summarize_insider(name, trades):
@@ -317,14 +327,7 @@ def summarize_insider(name, trades):
         "규칙: 전체 3~4문장으로 간결하게. 데이터에 없는 거래나 이유를 지어내지 마. "
         "매수/매도 추천은 하지 마. 객관적으로.\n\n" + body
     )
-    try:
-        resp = _client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt,
-        )
-        return resp.text.strip()
-    except Exception as e:
-        return _friendly_error(e)
+    return _simple_generate(prompt)
 
 
 def _grounded_generate(prompt):
@@ -493,5 +496,174 @@ def analyze_sector_policy_timeline(sector):
         "종목끼리는 세미콜론 ';'로 구분):\n"
         "TICKERS: AAPL | Apple; NVDA | NVIDIA\n"
         "(최대 8개, ETF·지수 제외, 없으면 'TICKERS: 없음').\n"
+    )
+    return _grounded_generate(prompt)
+
+def analyze_remarks_overview():
+    """웹검색으로 현 미국 대통령의 '최근 주요 발언'을 분야별로 묶어 한눈에 정리한다.
+    출처가 확인된 발언만 다루고, 정치 중립 + 투자 추천 없음.
+    반환: (dict 또는 None, error) — dict 형식은 _grounded_generate 참고."""
+    if _client is None:
+        return None, "(API 키가 설정되지 않았어요)"
+    prompt = (
+        "너는 정치적으로 철저히 중립적인 '투자 교육 도우미'야. "
+        "Google 검색을 적극 활용해서, '현재' 미국 대통령이 '최근(가능한 한 최신)' 공개적으로 한 "
+        "주요 발언들을 찾아, 산업·경제와 관련된 것 위주로 분야별로 묶어 한국어로 정리해줘.\n\n"
+        "형식 — 발언이 실제로 확인된 분야만 골라, 각 분야를 이렇게 써:\n"
+        "【분야명】\n"
+        "그 분야에 대해 대통령이 '언제, 무슨 취지로' 말했는지 1~2문장. 핵심 표현은 짧게 따옴표로 인용해도 되지만 "
+        "한 발언당 한 문장 이내로만. → 그 발언이 어떤 산업·기업에 영향이 거론되는지 한 문장.\n\n"
+        "다룰 수 있는 분야 예시: 반도체, AI 인프라, 에너지, 방산·국방, 제약·바이오, 관세·무역, 암호화폐, 전기차·배터리, 금리·세금 등.\n"
+        "(분야는 4~7개, 확인된 것만. 제목·번호·별표·# 기호는 쓰지 말고 위 【분야명】 표기만 사용.)\n\n"
+        "반드시 지킬 규칙:\n"
+        "1) 특정 정당·정치인을 옹호하거나 비난하지 마. 가치판단 없이 '무슨 말을 했다는 사실'과 '거론되는 영향'만 담백하게.\n"
+        "2) 매수/매도 추천은 절대 하지 마. '수혜 가능성이 거론된다' 같은 객관적 표현만.\n"
+        "3) ★검색으로 출처가 확인된 발언만 적어. 확인 안 되면 지어내지 말고 그 분야는 빼.★ "
+        "인터넷에는 가짜·왜곡 인용도 많으니, 신뢰할 만한 출처로 교차 확인된 것만 담아.\n"
+        "4) 긴 문장을 그대로 길게 베끼지 말고, 핵심만 짧게 인용하거나 네 말로 바꿔 써(저작권).\n"
+        "5) 전문용어는 쉬운 말로 풀어서. 한국어 존댓말로, 친근하지만 정확하게.\n"
+        "6) 분석의 '맨 마지막 줄'에만, 본문에서 언급한 '미국 증시 상장사'를 정확히 이 형식으로 한 줄 "
+        "(티커와 짧은 영어 회사명을 막대기 '|'로, 종목끼리는 세미콜론 ';'로 구분):\n"
+        "TICKERS: NVDA | NVIDIA; INTC | Intel\n"
+        "(최대 8개, ETF·지수는 제외, 관련 종목이 마땅치 않으면 'TICKERS: 없음'.)\n"
+    )
+    return _grounded_generate(prompt)
+
+
+def analyze_remarks_sector(sector):
+    """웹검색으로 현 미국 대통령이 특정 분야에 대해 한 발언들을 '최신 → 과거' 순서로
+    날짜·출처와 함께 모아 정리한다. 출처가 확인된 발언만, 정치 중립 + 투자 추천 없음.
+    반환: (dict 또는 None, error) — dict 형식은 _grounded_generate 참고."""
+    if _client is None:
+        return None, "(API 키가 설정되지 않았어요)"
+    from datetime import datetime
+    this_year = datetime.now().year
+    prompt = (
+        "너는 정치적으로 철저히 중립적인 '투자 교육 도우미'야. "
+        f"Google 검색을 적극 활용해서, '현재' 미국 대통령이 '{sector}' 분야에 대해 "
+        f"최근 몇 년간({this_year-3}년부터 {this_year}년까지) 공개적으로 한 발언들을 찾아, "
+        "'최신 → 과거' 순서로 한국어로 정리해줘.\n\n"
+        "형식 — 각 발언을 이렇게 한 항목씩:\n"
+        f"[{this_year}년 O월] 어떤 자리·맥락에서 무슨 말을 했는지. 핵심 표현은 짧게 따옴표로 인용 가능(한 문장 이내). "
+        "→ 그게 이 분야·관련 기업에 어떤 영향이 거론되는지 한 문장.\n"
+        "[2025년 O월] ...\n"
+        "이렇게 시기를 대괄호로 표시하고, 검색으로 확인된 발언 위주로 4~7개 적어. "
+        "(제목·번호·별표·# 기호는 쓰지 마. 시기는 검색으로 확인해 정확히.)\n\n"
+        "발언들 뒤에 마지막 문단으로, '이 발언들을 종합하면 대통령이 이 분야에서 어떤 방향을 시사하는지, "
+        "그리고 어떤 회사·종목이 그와 관련해 거론되는지'를 2~3문장으로 정리해줘.\n\n"
+        "반드시 지킬 규칙:\n"
+        "1) 특정 정당·정치인을 옹호하거나 비난하지 마. 사실과 거론되는 영향만 담백하게.\n"
+        "2) 매수/매도 추천 금지. '수혜 가능성이 거론된다' 같은 객관적 표현만.\n"
+        "3) ★검색으로 출처가 확인된 발언만. 확인 안 되면 지어내지 마.★ 인터넷엔 가짜 인용이 많으니 교차 확인된 것만.\n"
+        "4) 긴 문장을 길게 베끼지 말고 핵심만 짧게 인용하거나 네 말로 바꿔 써(저작권).\n"
+        "5) 전문용어는 쉬운 말로. 한국어 존댓말로.\n"
+        "6) 맨 마지막 줄에만 관련 '미국 증시 상장사'를 이 형식으로 (티커와 짧은 영어 회사명을 '|'로, "
+        "종목끼리는 세미콜론 ';'로 구분):\n"
+        "TICKERS: NVDA | NVIDIA\n"
+        "(최대 8개, ETF·지수 제외, 없으면 'TICKERS: 없음').\n"
+    )
+    return _grounded_generate(prompt)
+
+
+def analyze_trending_sectors():
+    """웹검색으로 '요즘 미국 증시에서 관심·화제가 집중되는 분야'를 순위로 정리하고,
+    각 분야에서 많이 거론되는 종목을 함께 보여준다. 추천이 아니라 '화제성' 정리. 정치 중립.
+    반환: (dict 또는 None, error) — dict 형식은 _grounded_generate 참고."""
+    if _client is None:
+        return None, "(API 키가 설정되지 않았어요)"
+    prompt = (
+        "너는 '투자 교육 도우미'야. Google 검색을 적극 활용해서, '지금(가능한 한 최신)' 미국 증시에서 "
+        "투자자·언론의 관심과 화제가 가장 많이 쏠리는 분야(테마)를 찾아 순위로 정리해줘. "
+        "한국 주식 초보자도 이해하게 한국어로.\n\n"
+        "형식 — 관심이 많은 순서대로 5~7개 분야를 이렇게 써:\n"
+        "【1위 · 분야명】\n"
+        "이 분야가 '왜' 요즘 화제인지(어떤 뉴스·이슈 때문인지) 1~2문장. → 이 분야에서 많이 거론되는 대표 종목 몇 개를 이름으로 언급.\n"
+        "【2위 · 분야명】\n"
+        "...\n\n"
+        "(제목·번호·별표·# 기호는 쓰지 말고 위 【순위 · 분야명】 표기만 사용.)\n\n"
+        "반드시 지킬 규칙:\n"
+        "1) ★이건 '추천'이 아니라 '요즘 화제가 되는 것'을 정리하는 거야. 사거나 팔라는 말은 절대 하지 마.★\n"
+        "2) ★중요: 관심이 많다고 좋은 투자라는 뜻이 아니야.★ 오히려 화제가 몰린 분야는 이미 가격이 많이 올라 "
+        "고평가·과열일 수 있어. 이 점을 맨 마지막에 꼭 한 문장으로 덧붙여.\n"
+        "3) 검색으로 확인된 사실 위주로. 확인 안 되면 지어내지 마.\n"
+        "4) 특정 정당·정치인 옹호/비난 금지. 전문용어는 쉬운 말로. 한국어 존댓말로.\n"
+        "5) 맨 마지막 줄에만, 본문에서 언급한 '미국 증시 상장사'를 이 형식으로 (티커와 짧은 영어 회사명을 '|'로, "
+        "종목끼리는 세미콜론 ';'로 구분):\n"
+        "TICKERS: NVDA | NVIDIA; PLTR | Palantir\n"
+        "(최대 8개, 없으면 'TICKERS: 없음'.)\n"
+    )
+    return _grounded_generate(prompt)
+
+
+def analyze_sector_focus(sector):
+    """웹검색으로 사용자가 직접 고른 분야에서 '요즘 관심받는 종목과 그 이유'를 정리한다.
+    추천이 아니라 화제성 정리. 정치 중립. 반환: (dict 또는 None, error)."""
+    if _client is None:
+        return None, "(API 키가 설정되지 않았어요)"
+    prompt = (
+        "너는 '투자 교육 도우미'야. Google 검색을 적극 활용해서, 미국 증시의 "
+        f"'{sector}' 분야에서 '요즘(가능한 한 최신)' 투자자·언론의 관심이 쏠리는 대표 종목들을 찾아, "
+        "한국 주식 초보자도 이해하게 한국어로 정리해줘.\n\n"
+        "형식 — 자연스러운 문단으로(제목·번호·별표·# 기호 금지):\n"
+        f"먼저 '{sector}' 분야가 지금 어떤 상황인지(무슨 이슈로 주목받는지) 2~3문장.\n"
+        "그다음 이 분야에서 많이 거론되는 대표 종목 3~6개를 '회사이름 — 왜 거론되는지 한 문장'으로 풀어줘.\n\n"
+        "반드시 지킬 규칙:\n"
+        "1) ★추천이 아니라 '요즘 화제'를 정리하는 거야. 사거나 팔라는 말 금지.★\n"
+        "2) ★관심이 많다고 좋은 투자라는 뜻이 아니야.★ 화제가 몰리면 이미 비쌀(고평가) 수 있다는 점을 마지막에 한 문장으로 덧붙여.\n"
+        "3) 검색으로 확인된 사실 위주로. 확인 안 되면 지어내지 마.\n"
+        "4) 특정 정당·정치인 옹호/비난 금지. 전문용어는 쉬운 말로. 한국어 존댓말로.\n"
+        "5) 맨 마지막 줄에만 본문에서 언급한 '미국 증시 상장사'를 이 형식으로 (티커·짧은 영어명을 '|'로, 종목끼리 ';'로):\n"
+        "TICKERS: NVDA | NVIDIA\n"
+        "(최대 8개, 없으면 'TICKERS: 없음'.)\n"
+    )
+    return _grounded_generate(prompt)
+
+
+def analyze_holding_thesis(name, ticker, holders=None, score=None, news=None):
+    """스마트머니가 보유한 종목에 대해 '왜 이런 큰손들이 들고 있을지(데이터 근거)'와
+    '앞으로의 전망(데이터+뉴스 기반, 거론되는 시나리오)'을 정리한다. 추천 아님, 중립.
+    holders: 보유 투자자 이름 리스트, score: score_stock 결과 dict, news: get_news 결과 리스트.
+    반환: (dict 또는 None, error)."""
+    if _client is None:
+        return None, "(API 키가 설정되지 않았어요)"
+    holders = holders or []
+    data_bits = []
+    if score:
+        if score.get("profit_score") is not None:
+            data_bits.append(f"수익성 점수 {score['profit_score']}/100")
+        if score.get("stability_score") is not None:
+            data_bits.append(f"안정성 점수 {score['stability_score']}/100")
+        if score.get("per") is not None:
+            data_bits.append(f"PER {score['per']}")
+        if score.get("upside_pct") is not None:
+            data_bits.append(f"애널리스트 목표가 상승여력 {score['upside_pct']}%")
+        if score.get("dividend_yield") is not None:
+            data_bits.append(f"배당수익률 {score['dividend_yield']}%")
+        if score.get("analyst_rec"):
+            data_bits.append(f"애널리스트 의견 {score['analyst_rec']}")
+        if score.get("sector"):
+            data_bits.append(f"업종 {score['sector']}")
+    data_line = "; ".join(data_bits) if data_bits else "(지표 데이터 부족)"
+    news_titles = [n.get("title", "") for n in (news or [])[:5] if n.get("title")]
+    news_line = " / ".join(news_titles) if news_titles else "없음"
+    holder_line = ", ".join(holders[:6]) if holders else "여러 유명 기관"
+
+    prompt = (
+        "너는 종목·정치에 중립적인 '투자 교육 도우미'야. Google 검색도 활용해서 "
+        f"미국 상장사 '{name}'({ticker})에 대해, 한국 주식 초보자도 이해하게 한국어로 정리해줘.\n\n"
+        f"참고 — 이 종목을 보유한 유명 투자자/기관: {holder_line}\n"
+        f"이 앱이 계산한 지표: {data_line}\n"
+        f"최근 뉴스 제목: {news_line}\n\n"
+        "아래 두 가지를 자연스러운 문단으로 써(제목·번호·별표·# 기호 금지, 각 묶음 앞에만 【 】 표기 사용):\n"
+        "【왜 보유】 이런 큰손들이 이 회사를 들고 있는 '이유로 거론되는' 점들. 이 회사가 뭘로 돈을 버는지, "
+        "강점(해자)·재무·성장성 등을 위 지표와 검색으로 확인된 사실 위주로. 추측이면 추측이라고 밝혀.\n"
+        "【전망】 데이터와 최근 뉴스가 가리키는 앞으로의 그림. 긍정적으로 거론되는 점과 위험·우려로 거론되는 점을 "
+        "'균형 있게'. 확정적 예측처럼 말하지 말고 '거론된다/가능성이 있다'로 표현해.\n\n"
+        "반드시 지킬 규칙:\n"
+        "1) ★매수·매도 추천 절대 금지.★ 큰손이 샀다는 게 '좋다'는 뜻이 아니고, 13F는 분기 뒤 공시라 "
+        "지금은 이미 팔았을 수도 있다는 점을 꼭 한 번 짚어줘.\n"
+        "2) 검색·지표로 확인 안 된 건 지어내지 마. 모르면 솔직히 말해.\n"
+        "3) 전문용어는 쉬운 말로 풀어서. 한국어 존댓말로.\n"
+        "4) 맨 마지막 줄에 'TICKERS: 없음'이라고만 적어.\n"
     )
     return _grounded_generate(prompt)
