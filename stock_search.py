@@ -142,14 +142,15 @@ def search_ticker(query):
     return None, None
 
 
-def get_price_history(ticker, period="20y"):
+def get_price_history(ticker, period="20y", interval="1mo"):
     """주가 히스토리를 반환한다. 반환: (날짜리스트, 종가리스트) 또는 ([], [])."""
     try:
-        # 20년은 월별, 짧으면 더 촘촘하게
-        hist = yf.Ticker(ticker).history(period=period, interval="1mo")
+        hist = yf.Ticker(ticker).history(period=period, interval=interval)
         if hist.empty:
             return [], []
-        dates = [d.strftime("%Y-%m") for d in hist.index]
+        # 일별이면 날짜까지, 주별/월별이면 연-월까지만 표시
+        fmt = "%Y-%m-%d" if interval.endswith("d") else "%Y-%m"
+        dates = [d.strftime(fmt) for d in hist.index]
         closes = [round(float(c), 2) for c in hist["Close"]]
         return dates, closes
     except Exception:
